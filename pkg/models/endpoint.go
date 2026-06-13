@@ -139,12 +139,28 @@ type Endpoint struct {
 
 // PluginAnalysis contains the analysis results for a single plugin
 type PluginAnalysis struct {
-	PluginSlug string     `json:"plugin_slug"`
-	PluginName string     `json:"plugin_name"`
-	Version    string     `json:"version"`
-	Endpoints  []Endpoint `json:"endpoints"`
-	FilesCount int        `json:"files_analyzed"`
-	Errors     []string   `json:"errors,omitempty"`
+	PluginSlug     string          `json:"plugin_slug"`
+	PluginName     string          `json:"plugin_name"`
+	Version        string          `json:"version"`
+	Endpoints      []Endpoint      `json:"endpoints"`
+	FilesCount     int             `json:"files_analyzed"`
+	Errors         []string        `json:"errors,omitempty"`
+	CoverageReport *CoverageReport `json:"coverage_report,omitempty"`
+}
+
+// RESTCoverageGap represents a register_rest_route() call that produced no detected endpoint
+type RESTCoverageGap struct {
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	RawCode string `json:"raw_code"`
+	Reason  string `json:"reason"`
+}
+
+// CoverageReport summarizes REST endpoint detection completeness
+type CoverageReport struct {
+	TotalRESTRouteCalls int                `json:"total_rest_route_calls"`
+	DetectedEndpoints   int                `json:"detected_endpoints"`
+	Gaps                []RESTCoverageGap  `json:"gaps,omitempty"`
 }
 
 // EndpointsByAuth groups endpoints by authentication level

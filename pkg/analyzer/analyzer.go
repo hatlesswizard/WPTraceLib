@@ -247,6 +247,13 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 	// Deduplicate endpoints (same route, method, type within a plugin)
 	analysis.Endpoints = deduplicateEndpoints(analysis.Endpoints)
 
+	// PASS 3.7: REST Coverage Audit
+	// Compare detected REST endpoints against register_rest_route() calls in source
+	coverageReport := AuditRESTCoverage(pluginDir, analysis.Endpoints, strippedContentCache)
+	if coverageReport != nil {
+		analysis.CoverageReport = coverageReport
+	}
+
 	// PASS 4: Enrich endpoints with call graph analysis
 	// CONDITIONAL: Only enrich if chain analysis is enabled
 	// This uses the plugin-wide function index to follow calls across all files
@@ -466,6 +473,12 @@ func (a *Analyzer) analyzeFileWithCache(ctx context.Context, filepath string, pl
 	if wrapperRegistry != nil && len(wrapperRegistry.Wrappers) > 0 {
 		wrapperEndpoints := DetectWrapperCalls(strippedContent, relPath, pluginSlug, wrapperRegistry)
 		endpoints = append(endpoints, wrapperEndpoints...)
+	}
+
+	// Detect REST endpoints via REST wrappers (register_rest_route inside wrapper methods)
+	if wrapperRegistry != nil && len(wrapperRegistry.RESTWrappers) > 0 {
+		restWrapperEndpoints := DetectRESTWrapperCalls(strippedContent, relPath, pluginSlug, wrapperRegistry)
+		endpoints = append(endpoints, restWrapperEndpoints...)
 	}
 
 	return endpoints, errors, strippedContent
@@ -860,6 +873,12 @@ func (a *Analyzer) analyzeFileWithContent(ctx context.Context, filepath string, 
 	if wrapperRegistry != nil && len(wrapperRegistry.Wrappers) > 0 {
 		wrapperEndpoints := DetectWrapperCalls(strippedContent, relPath, pluginSlug, wrapperRegistry)
 		endpoints = append(endpoints, wrapperEndpoints...)
+	}
+
+	// Detect REST endpoints via REST wrappers (register_rest_route inside wrapper methods)
+	if wrapperRegistry != nil && len(wrapperRegistry.RESTWrappers) > 0 {
+		restWrapperEndpoints := DetectRESTWrapperCalls(strippedContent, relPath, pluginSlug, wrapperRegistry)
+		endpoints = append(endpoints, restWrapperEndpoints...)
 	}
 
 	// NOTE: Call graph enrichment is now done at the plugin level in AnalyzePlugin
