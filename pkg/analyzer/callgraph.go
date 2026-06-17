@@ -1733,12 +1733,167 @@ func (cg *PluginCallGraph) GetAllHTTPReachableFiles(endpoints []models.Endpoint)
 	cg.HookRegistry.mu.RUnlock()
 
 	// Mark all files included from the plugin root file(s) as reachable
-	// (main plugin file is always loaded by WordPress)
 	for fp := range cg.AllFiles {
 		if !strings.Contains(fp, "/") {
 			reachable[fp] = true
 		}
 	}
+	cg.followIncludes(reachable)
+
+	// Strategy: Autoload base directory coverage
+	// If autoloading is detected, all files under autoload dirs are potentially loadable
+	if len(cg.AutoloadBaseDirs) > 0 {
+		for f := range cg.AllFiles {
+			for _, baseDir := range cg.AutoloadBaseDirs {
+				if baseDir != "" && (strings.HasPrefix(f, baseDir+"/") || f == baseDir) {
+					reachable[f] = true
+					break
+				}
+			}
+		}
+	}
+
+	// Strategy: Dynamic includer directory coverage
+	// If a reachable dynamic includer's hints point to directories, mark all files there
+	cg.mu.RLock()
+	for funcName, hints := range cg.DynIncluders {
+		isReachable := false
+		if def, ok := cg.Functions[funcName]; ok && def.FilePath != "" {
+			isReachable = reachable[def.FilePath]
+		}
+		if !isReachable {
+			bareName := funcName
+			if idx := strings.LastIndex(funcName, "::"); idx >= 0 {
+				bareName = funcName[idx+2:]
+			}
+			if def, ok := cg.Functions[bareName]; ok && def.FilePath != "" {
+				isReachable = reachable[def.FilePath]
+			}
+		}
+		if isReachable {
+			for _, hint := range hints {
+				hint = strings.TrimSuffix(hint, "/")
+				if hint == "" || hint == "." {
+					continue
+				}
+				for f := range cg.AllFiles {
+					if strings.HasPrefix(f, hint+"/") {
+						reachable[f] = true
+					}
+				}
+			}
+		}
+	}
+	cg.mu.RUnlock()
+
+	// Strategy: Class reference coverage
+	// Any class referenced in the call graph that maps to a file is reachable
+	cg.mu.RLock()
+	for className, classFile := range cg.ClassToFile {
+		if reachable[classFile] {
+			continue
+		}
+		// Check if any reachable function references this class
+		for funcName := range cg.Functions {
+			if strings.HasPrefix(funcName, className+"::") {
+				if def := cg.Functions[funcName]; def != nil && reachable[def.FilePath] {
+					reachable[classFile] = true
+					break
+				}
+			}
+		}
+	}
+	cg.mu.RUnlock()
+
+	// Strategy: Template/module directory coverage
+	// If any file from a conventional WordPress directory is already reachable,
+	// mark all files in that directory as reachable
+	templateDirNames := map[string]bool{
+		"templates": true, "views": true, "partials": true, "tpl": true,
+		"modules": true, "widgets": true, "blocks": true, "extensions": true,
+	}
+	// Find template/module directory ROOTS from reachable files AND all known files
+	// If the plugin has endpoints (which it does if we're here), template/module dirs are loadable
+	reachableTemplateRoots := make(map[string]bool)
+	// From reachable files
+	for f := range reachable {
+		parts := strings.Split(f, "/")
+		for i, part := range parts {
+			if templateDirNames[strings.ToLower(part)] {
+				root := strings.Join(parts[:i+1], "/")
+				reachableTemplateRoots[root] = true
+				break
+			}
+		}
+	}
+	// Also check if any include edge targets a template dir
+	for _, includes := range cg.IncludesFrom {
+		for _, inc := range includes {
+			parts := strings.Split(inc, "/")
+			for i, part := range parts {
+				if templateDirNames[strings.ToLower(part)] {
+					root := strings.Join(parts[:i+1], "/")
+					reachableTemplateRoots[root] = true
+					break
+				}
+			}
+		}
+	}
+	// Also check dynamic includer hints
+	for _, hints := range cg.DynIncluders {
+		for _, hint := range hints {
+			parts := strings.Split(hint, "/")
+			for i, part := range parts {
+				if templateDirNames[strings.ToLower(part)] {
+					root := strings.Join(parts[:i+1], "/")
+					reachableTemplateRoots[root] = true
+					break
+				}
+			}
+		}
+	}
+	// For plugins with endpoints, also scan all files — if a template dir exists,
+	// its contents are loadable by the plugin's template loading infrastructure
+	if len(endpoints) > 0 {
+		for f := range cg.AllFiles {
+			parts := strings.Split(f, "/")
+			for i, part := range parts {
+				if templateDirNames[strings.ToLower(part)] {
+					root := strings.Join(parts[:i+1], "/")
+					reachableTemplateRoots[root] = true
+					break
+				}
+			}
+		}
+	}
+	// Mark ALL files under any reachable template root
+	for f := range cg.AllFiles {
+		for root := range reachableTemplateRoots {
+			if strings.HasPrefix(f, root+"/") {
+				reachable[f] = true
+				break
+			}
+		}
+	}
+
+	// Strategy: Vendor directory unity
+	// If any vendor file is reachable, the whole vendor library is loadable
+	vendorReachable := false
+	for f := range reachable {
+		if strings.HasPrefix(f, "vendor/") {
+			vendorReachable = true
+			break
+		}
+	}
+	if vendorReachable {
+		for f := range cg.AllFiles {
+			if strings.HasPrefix(f, "vendor/") {
+				reachable[f] = true
+			}
+		}
+	}
+
+	// Final: follow includes from newly reachable files
 	cg.followIncludes(reachable)
 
 	return reachable
