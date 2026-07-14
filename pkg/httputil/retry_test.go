@@ -224,3 +224,31 @@ func TestDoWithRetry_OnRetryCallback(t *testing.T) {
 		t.Errorf("expected 2 OnRetry calls, got %d", callbackCalls)
 	}
 }
+
+func TestDoWithRetryProviderAcquiresClientPerAttempt(t *testing.T) {
+	var requests int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&requests, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	var factoryCalls int32
+	provider := func() *http.Client {
+		atomic.AddInt32(&factoryCalls, 1)
+		return server.Client()
+	}
+	req, _ := http.NewRequest(http.MethodGet, server.URL, nil)
+	cfg := RetryConfig{MaxRetries: 2, BaseDelay: time.Microsecond, MaxDelay: time.Microsecond}
+	resp, err := DoWithRetryProvider(context.Background(), provider, req, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if factoryCalls != 2 {
+		t.Fatalf("factory called %d times, want once per each of 2 attempts", factoryCalls)
+	}
+}

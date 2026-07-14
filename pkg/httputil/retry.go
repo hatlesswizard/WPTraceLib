@@ -67,9 +67,25 @@ func (e *RetryError) Unwrap() error {
 	return e.LastError
 }
 
-// DoWithRetry executes an HTTP request with retry logic.
-// It returns the response (caller must close body) or an error after exhausting retries.
+// ClientProvider returns the HTTP client to use for one request attempt. A provider
+// may return a different client on every call (for example, to rotate proxies).
+type ClientProvider func() *http.Client
+
+// StaticClientProvider adapts a fixed client to ClientProvider.
+func StaticClientProvider(client *http.Client) ClientProvider {
+	return func() *http.Client { return client }
+}
+
+// DoWithRetry executes an HTTP request with retry logic using a fixed client.
+// It is retained for backwards compatibility. Use DoWithRetryProvider when the
+// client must be selected independently for every attempt.
 func DoWithRetry(ctx context.Context, client *http.Client, req *http.Request, cfg RetryConfig) (*http.Response, error) {
+	return DoWithRetryProvider(ctx, StaticClientProvider(client), req, cfg)
+}
+
+// DoWithRetryProvider executes an HTTP request with retry logic, acquiring a
+// client from provider immediately before every attempt.
+func DoWithRetryProvider(ctx context.Context, provider ClientProvider, req *http.Request, cfg RetryConfig) (*http.Response, error) {
 	var lastErr error
 	var lastStatusCode int
 
@@ -82,6 +98,13 @@ func DoWithRetry(ctx context.Context, client *http.Client, req *http.Request, cf
 		// Clone request for retry (body must be re-readable or nil for GET)
 		reqCopy := req.Clone(ctx)
 
+		var client *http.Client
+		if provider != nil {
+			client = provider()
+		}
+		if client == nil {
+			client = http.DefaultClient
+		}
 		resp, err := client.Do(reqCopy)
 
 		// Success case

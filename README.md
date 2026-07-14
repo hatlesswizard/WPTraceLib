@@ -43,6 +43,12 @@ This produces a `wptracelib` binary (`wptracelib.exe` on Windows).
 # Download and analyze popular plugins from WordPress.org (first 5 pages)
 ./wptracelib -pages 5 -output ./plugins
 
+# Stop after 25 successfully resolved plugins (0 means all)
+./wptracelib -plugins 25 -output ./plugins
+
+# Page and plugin limits are independent; the first exhausted boundary wins
+./wptracelib -pages 5 -plugins 25 -output ./plugins
+
 # Show statistics only
 ./wptracelib -analyze ./plugins -stats
 
@@ -70,6 +76,7 @@ Run `./wptracelib -h` for the full flag list.
 ```go
 import (
     "context"
+    "net/http"
 
     "github.com/hatlesswizard/wptracelib"
     "github.com/hatlesswizard/wptracelib/pkg/analyzer"
@@ -78,8 +85,17 @@ import (
 func main() {
     cfg := wptracelib.Config{
         OutputDir: "./plugins",
-        Workers:   10,
-        ChainMode: analyzer.ChainModeHierarchical, // or ChainModeNone, ChainModeFlat
+        Workers:    10,
+        MaxPages:   0,  // all popular-plugin pages
+        MaxPlugins: 0,  // all successfully resolved plugins
+        ChainMode:  analyzer.ChainModeHierarchical, // or ChainModeNone, ChainModeFlat
+
+        // Optional: called for every HTTP attempt (popular pages, plugin
+        // details, and ZIP downloads), so callers can rotate transports/proxies.
+        // Nil uses WPTraceLib's default direct clients.
+        HTTPClientFactory: func() *http.Client {
+            return http.DefaultClient
+        },
     }
     lib := wptracelib.New(cfg)
 

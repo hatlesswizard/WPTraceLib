@@ -23,6 +23,7 @@ func main() {
 	outputDir := flag.String("output", "./plugins", "Directory to download plugins to")
 	workers := flag.Int("workers", 10, "Number of concurrent workers")
 	maxPages := flag.Int("pages", 0, "Maximum number of pages to scrape (0 = all)")
+	maxPlugins := flag.Int("plugins", 0, "Maximum successful plugins to fetch (0 = all)")
 	analyzeOnly := flag.String("analyze", "", "Analyze existing plugins in directory")
 	listOnly := flag.Bool("list-only", false, "Only list plugins without downloading")
 
@@ -73,6 +74,7 @@ func main() {
 		Workers:        *workers,
 		ExtractPlugins: true,
 		MaxPages:       *maxPages,
+		MaxPlugins:     *maxPlugins,
 		ChainMode:      chainMode,
 	}
 

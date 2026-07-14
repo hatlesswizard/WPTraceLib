@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,13 @@ type Config struct {
 	// MaxPages limits the number of popular plugin pages to scrape (0 = all)
 	MaxPages int
 
+	// MaxPlugins limits successfully resolved plugins in popularity order (0 = all)
+	MaxPlugins int
+
+	// HTTPClientFactory is called once per HTTP attempt, including retries.
+	// Nil uses WPTraceLib's default direct clients.
+	HTTPClientFactory func() *http.Client
+
 	// ChainMode specifies the call chain analysis mode
 	// 0 (ChainModeNone): Skip call chain analysis (default, fastest)
 	// 1 (ChainModeFlat): Build flat call lists
@@ -52,6 +60,7 @@ func DefaultConfig() Config {
 		MetadataFile:   "plugins.json",
 		ExtractPlugins: true,
 		MaxPages:       0,
+		MaxPlugins:     0,
 	}
 }
 
@@ -69,20 +78,26 @@ func New(cfg Config) *WPTraceLib {
 		cfg.Workers = 10
 	}
 
+	scraperOptions := []scraper.Option{scraper.WithWorkers(cfg.Workers)}
+	downloaderOptions := []downloader.Option{downloader.WithWorkers(cfg.Workers), downloader.WithOutputDir(cfg.OutputDir), downloader.WithExtract(cfg.ExtractPlugins)}
+	if cfg.HTTPClientFactory != nil {
+		scraperOptions = append(scraperOptions, scraper.WithHTTPClientProvider(cfg.HTTPClientFactory))
+		downloaderOptions = append(downloaderOptions, downloader.WithHTTPClientProvider(cfg.HTTPClientFactory))
+	}
 	return &WPTraceLib{
 		config:     cfg,
-		scraper:    scraper.New(scraper.WithWorkers(cfg.Workers)),
-		downloader: downloader.New(downloader.WithWorkers(cfg.Workers), downloader.WithOutputDir(cfg.OutputDir), downloader.WithExtract(cfg.ExtractPlugins)),
+		scraper:    scraper.New(scraperOptions...),
+		downloader: downloader.New(downloaderOptions...),
 		analyzer:   analyzer.New(analyzer.WithWorkers(cfg.Workers), analyzer.WithChainMode(cfg.ChainMode)),
 	}
 }
 
 // FetchPluginList fetches the list of popular WordPress plugins
 func (w *WPTraceLib) FetchPluginList(ctx context.Context) ([]models.PluginInfo, error) {
-	if w.config.MaxPages > 0 {
-		return w.scraper.FetchPopularPluginsWithPages(ctx, w.config.MaxPages)
+	if w.config.MaxPlugins < 0 {
+		return nil, fmt.Errorf("MaxPlugins cannot be negative: %d", w.config.MaxPlugins)
 	}
-	return w.scraper.FetchPopularPlugins(ctx)
+	return w.scraper.FetchPopularPluginsBounded(ctx, w.config.MaxPages, w.config.MaxPlugins)
 }
 
 // DownloadPlugins downloads all specified plugins

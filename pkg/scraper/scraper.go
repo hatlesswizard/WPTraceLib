@@ -36,11 +36,12 @@ var (
 
 // Scraper fetches plugin information from WordPress.org
 type Scraper struct {
-	client    *http.Client
-	baseURL   string
-	apiURL    string
-	userAgent string
-	workers   int
+	client         *http.Client
+	clientProvider httputil.ClientProvider
+	baseURL        string
+	apiURL         string
+	userAgent      string
+	workers        int
 }
 
 // Option is a functional option for configuring the Scraper
@@ -50,6 +51,13 @@ type Option func(*Scraper)
 func WithHTTPClient(client *http.Client) Option {
 	return func(s *Scraper) {
 		s.client = client
+	}
+}
+
+// WithHTTPClientProvider sets a provider that is called once per HTTP attempt.
+func WithHTTPClientProvider(provider httputil.ClientProvider) Option {
+	return func(s *Scraper) {
+		s.clientProvider = provider
 	}
 }
 
@@ -93,38 +101,59 @@ func (s *Scraper) FetchPopularPlugins(ctx context.Context) ([]models.PluginInfo,
 	return s.FetchPopularPluginsWithPages(ctx, 0) // 0 means all pages
 }
 
-// FetchPopularPluginsWithPages fetches plugins from the specified number of pages
-// If maxPages is 0, fetches all available pages
+// FetchPopularPluginsWithPages fetches plugins from the specified number of pages.
+// If maxPages is 0, all available pages are considered.
 func (s *Scraper) FetchPopularPluginsWithPages(ctx context.Context, maxPages int) ([]models.PluginInfo, error) {
-	// First, determine total pages by fetching page 1
+	return s.FetchPopularPluginsBounded(ctx, maxPages, 0)
+}
+
+// FetchPopularPluginsBounded returns at most maxPlugins successfully resolved
+// plugins in WordPress popularity order. Zero limits mean unlimited.
+func (s *Scraper) FetchPopularPluginsBounded(ctx context.Context, maxPages, maxPlugins int) ([]models.PluginInfo, error) {
+	if maxPlugins < 0 {
+		return nil, fmt.Errorf("max plugins cannot be negative: %d", maxPlugins)
+	}
+
 	totalPages, slugs, err := s.fetchFirstPage(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch first page: %w", err)
 	}
-
-	if maxPages > 0 && maxPages < totalPages {
+	if maxPages > 0 && totalPages > maxPages {
 		totalPages = maxPages
 	}
 
-	// Collect all slugs from remaining pages concurrently
-	allSlugs := slugs
-	if totalPages > 1 {
-		remainingSlugs, err := s.fetchRemainingPages(ctx, 2, totalPages)
+	plugins := make([]models.PluginInfo, 0)
+	seen := make(map[string]bool)
+	for page := 1; page <= totalPages; page++ {
+		if page > 1 {
+			slugs, err = s.fetchPage(ctx, page)
+			if err != nil {
+				return nil, fmt.Errorf("failed to fetch page %d: %w", page, err)
+			}
+		}
+		pageSlugs := make([]string, 0, len(slugs))
+		for _, slug := range slugs {
+			if !seen[slug] {
+				seen[slug] = true
+				pageSlugs = append(pageSlugs, slug)
+			}
+		}
+		remaining := 0
+		if maxPlugins > 0 {
+			remaining = maxPlugins - len(plugins)
+			if remaining == 0 {
+				break
+			}
+		}
+		resolved, err := s.fetchPluginDetailsBounded(ctx, pageSlugs, remaining)
 		if err != nil {
 			return nil, err
 		}
-		allSlugs = append(allSlugs, remainingSlugs...)
+		plugins = append(plugins, resolved...)
+		if maxPlugins > 0 && len(plugins) >= maxPlugins {
+			break
+		}
 	}
-
-	// Deduplicate slugs
-	allSlugs = deduplicate(allSlugs)
-
-	// Fetch detailed plugin info concurrently
-	plugins, err := s.fetchPluginDetails(ctx, allSlugs)
-	if err != nil {
-		return nil, err
-	}
-
 	return plugins, nil
 }
 
@@ -138,7 +167,7 @@ func (s *Scraper) fetchFirstPage(ctx context.Context) (int, []string, error) {
 	}
 	req.Header.Set("User-Agent", s.userAgent)
 
-	resp, err := httputil.DoWithRetry(ctx, s.client, req, httputil.DefaultRetryConfig())
+	resp, err := httputil.DoWithRetryProvider(ctx, s.httpClientProvider(), req, httputil.DefaultRetryConfig())
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to fetch first page: %w", err)
 	}
@@ -260,7 +289,7 @@ func (s *Scraper) fetchPage(ctx context.Context, page int) ([]string, error) {
 	}
 	req.Header.Set("User-Agent", s.userAgent)
 
-	resp, err := httputil.DoWithRetry(ctx, s.client, req, httputil.DefaultRetryConfig())
+	resp, err := httputil.DoWithRetryProvider(ctx, s.httpClientProvider(), req, httputil.DefaultRetryConfig())
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch page %d: %w", page, err)
 	}
@@ -278,37 +307,53 @@ func (s *Scraper) fetchPage(ctx context.Context, page int) ([]string, error) {
 	return s.extractPluginSlugs(doc), nil
 }
 
-// fetchPluginDetails fetches detailed info for all plugins concurrently
-func (s *Scraper) fetchPluginDetails(ctx context.Context, slugs []string) ([]models.PluginInfo, error) {
-	var mu sync.Mutex
+// fetchPluginDetailsBounded fetches details concurrently while preserving input
+// order. For a positive limit, it requests only enough additional records to
+// replace failures and reach that many successes.
+func (s *Scraper) fetchPluginDetailsBounded(ctx context.Context, slugs []string, limit int) ([]models.PluginInfo, error) {
 	plugins := make([]models.PluginInfo, 0, len(slugs))
-
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(s.workers)
-
-	for _, slug := range slugs {
-		slug := slug // capture for goroutine
-		g.Go(func() error {
-			info, err := s.FetchPluginInfo(ctx, slug)
-			if err != nil {
-				// Log error but don't fail the entire operation
-				fmt.Printf("Warning: failed to fetch plugin %s: %v\n", slug, err)
+	for next := 0; next < len(slugs) && (limit == 0 || len(plugins) < limit); {
+		batchSize := s.workers
+		if limit > 0 && batchSize > limit-len(plugins) {
+			batchSize = limit - len(plugins)
+		}
+		if batchSize > len(slugs)-next {
+			batchSize = len(slugs) - next
+		}
+		type result struct {
+			info *models.PluginInfo
+			err  error
+		}
+		results := make([]result, batchSize)
+		g, groupCtx := errgroup.WithContext(ctx)
+		for i := 0; i < batchSize; i++ {
+			i, slug := i, slugs[next+i]
+			g.Go(func() error {
+				results[i].info, results[i].err = s.FetchPluginInfo(groupCtx, slug)
 				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+		for i, result := range results {
+			if result.err != nil {
+				fmt.Printf("Warning: failed to fetch plugin %s: %v\n", slugs[next+i], result.err)
+				continue
 			}
-
-			mu.Lock()
-			plugins = append(plugins, *info)
-			mu.Unlock()
-
-			return nil
-		})
+			plugins = append(plugins, *result.info)
+			if limit > 0 && len(plugins) == limit {
+				break
+			}
+		}
+		next += batchSize
 	}
-
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
 	return plugins, nil
+}
+
+// fetchPluginDetails fetches all details and is retained for package callers.
+func (s *Scraper) fetchPluginDetails(ctx context.Context, slugs []string) ([]models.PluginInfo, error) {
+	return s.fetchPluginDetailsBounded(ctx, slugs, 0)
 }
 
 // FetchPluginInfo fetches detailed information for a single plugin
@@ -321,7 +366,7 @@ func (s *Scraper) FetchPluginInfo(ctx context.Context, slug string) (*models.Plu
 	}
 	req.Header.Set("User-Agent", s.userAgent)
 
-	resp, err := httputil.DoWithRetry(ctx, s.client, req, httputil.DefaultRetryConfig())
+	resp, err := httputil.DoWithRetryProvider(ctx, s.httpClientProvider(), req, httputil.DefaultRetryConfig())
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch plugin info for %s: %w", slug, err)
 	}
@@ -358,4 +403,11 @@ func deduplicate(items []string) []string {
 	}
 
 	return result
+}
+
+func (s *Scraper) httpClientProvider() httputil.ClientProvider {
+	if s.clientProvider != nil {
+		return s.clientProvider
+	}
+	return httputil.StaticClientProvider(s.client)
 }

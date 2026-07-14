@@ -36,12 +36,13 @@ type ProgressCallback func(completed, total int, current models.PluginInfo)
 
 // Downloader handles concurrent plugin downloads
 type Downloader struct {
-	client    *http.Client
-	outputDir string
-	workers   int
-	userAgent string
-	extract   bool
-	progress  ProgressCallback
+	client         *http.Client
+	clientProvider httputil.ClientProvider
+	outputDir      string
+	workers        int
+	userAgent      string
+	extract        bool
+	progress       ProgressCallback
 }
 
 // Option is a functional option for configuring the Downloader
@@ -51,6 +52,13 @@ type Option func(*Downloader)
 func WithHTTPClient(client *http.Client) Option {
 	return func(d *Downloader) {
 		d.client = client
+	}
+}
+
+// WithHTTPClientProvider sets a provider that is called once per HTTP attempt.
+func WithHTTPClientProvider(provider httputil.ClientProvider) Option {
+	return func(d *Downloader) {
+		d.clientProvider = provider
 	}
 }
 
@@ -165,7 +173,7 @@ func (d *Downloader) Download(ctx context.Context, plugin models.PluginInfo) Dow
 	req.Header.Set("User-Agent", d.userAgent)
 
 	// Execute request with retry logic
-	resp, err := httputil.DoWithRetry(ctx, d.client, req, httputil.DefaultRetryConfig())
+	resp, err := httputil.DoWithRetryProvider(ctx, d.httpClientProvider(), req, httputil.DefaultRetryConfig())
 	if err != nil {
 		result.Error = fmt.Errorf("failed to download after retries: %w", err)
 		return result
@@ -288,4 +296,11 @@ func isInsidePath(base, target string) bool {
 // GetOutputDir returns the output directory
 func (d *Downloader) GetOutputDir() string {
 	return d.outputDir
+}
+
+func (d *Downloader) httpClientProvider() httputil.ClientProvider {
+	if d.clientProvider != nil {
+		return d.clientProvider
+	}
+	return httputil.StaticClientProvider(d.client)
 }
