@@ -420,27 +420,40 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		if className != "" && cg.Functions[funcName] == nil {
 			cg.Functions[funcName] = funcDef
 		}
+		if className != "" {
+			cg.CallsFrom[key] = calls
+		}
 
-		// DETERMINISM: For standalone functions (no class), track ambiguity
-		// when multiple files define the same function name.
-		// Store each implementation under a file-qualified key so buildCallTree
-		// can resolve all implementations for ambiguous names.
-		if className == "" {
+		// DETERMINISM: track ambiguity when several definitions share a bare
+		// name, and keep every function reachable under that bare name.
+		//
+		// This block runs for METHODS as well as standalone functions, and must.
+		// Every lookup in this package falls back from "Class::method" to the
+		// bare method name, and none goes the other way (see
+		// GetRecursiveCallsForCallback and recurseCalls). extractCalls also
+		// strips class prefixes from most call sites. So a method stored only
+		// under its qualified key would vanish from every call chain -- which is
+		// how it behaved before findClassRanges was fixed, when className was
+		// always empty and this branch happened to run for everything.
+		{
 			// Create a file-qualified key: "basename.php::funcName"
 			fileBase := filepath.Base(filePath)
 			fileQualifiedKey := fileBase + "::" + funcName
 			if _, alreadyExists := cg.CallsFrom[funcName]; alreadyExists {
-				// Collision: another file already defined this function
+				// Collision: another definition already claimed this bare name
 				cg.AmbiguousFuncs[funcName] = append(cg.AmbiguousFuncs[funcName], fileQualifiedKey)
 				// Store the file-qualified version separately
-				cg.CallsFrom[fileQualifiedKey] = calls
-				cg.Functions[fileQualifiedKey] = funcDef
+				if _, dup := cg.CallsFrom[fileQualifiedKey]; !dup {
+					cg.CallsFrom[fileQualifiedKey] = calls
+					cg.Functions[fileQualifiedKey] = funcDef
+				}
 			} else {
-				// First time seeing this function name — store normally
+				// First time seeing this bare name — store normally.
+				// Functions[funcName] is first-writer above, so both maps now
+				// agree on which definition the bare name denotes; they used to
+				// disagree, Functions being last-writer and CallsFrom first.
 				cg.CallsFrom[funcName] = calls
 			}
-		} else {
-			cg.CallsFrom[key] = calls
 		}
 
 		for _, callee := range calls {
@@ -462,12 +475,17 @@ func findClassRanges(content string) map[string][2]int {
 
 		className := content[match[2]:match[3]]
 
-		// Find the opening brace of the class
-		bracePos := strings.Index(content[match[1]:], "{")
-		if bracePos < 0 {
+		// classDefPattern ends with `\s*\{`, so the match already consumes the
+		// class's own opening brace and match[1]-1 is its offset. Searching for
+		// the next "{" after the match found the first METHOD's brace instead,
+		// which made every recorded range one method body. No function
+		// declaration then fell inside any range, so className was empty for
+		// every function in every plugin and Class::method keys were never
+		// created.
+		openBrace := match[1] - 1
+		if openBrace < 0 || openBrace >= len(content) || content[openBrace] != '{' {
 			continue
 		}
-		openBrace := match[1] + bracePos
 
 		// Find the matching closing brace
 		closeBrace := findMatchingBrace(content, openBrace)
