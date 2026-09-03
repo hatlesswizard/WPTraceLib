@@ -803,15 +803,39 @@ func ParsePermissionCallbackWithContext(code string, fullFileContent string) (st
 				if level != models.Unauthenticated {
 					return callback, level
 				}
-				// Even if function body analysis returns Unauthenticated,
-				// the presence of a named callback suggests auth is required
-				if callback != "" {
-					// Check name-based admin indicators as final confirmation
-					if isAdminPermissionCallbackName(callback) {
-						return callback, models.Admin
-					}
-					return callback, models.Subscriber
+				// The body was found and analysed and it asserts nothing about
+				// who the caller is. Trust that.
+				//
+				// This used to fall through to Subscriber on the reasoning that
+				// "the presence of a named callback suggests auth is required".
+				// It does not. A permission callback is free to check anything,
+				// and plenty check something that is not identity at all:
+				//
+				//   public function impersonate_user_permissions_check( $request ) {
+				//       $name  = $request->get_param( 'username' );
+				//       $token = $request->get_param( 'multi_manager_wp_login_token' );
+				//       if ( empty( $name ) || empty( $token ) ) { return new WP_Error(...); }
+				//       return $this->impersonate_token_check( $name, $token );
+				//   }
+				//
+				// Everything it inspects comes from the request, so it
+				// establishes no privilege whatsoever -- which is precisely why
+				// CVE-2024-11028 is exploitable unauthenticated. Reporting
+				// Subscriber there overstates the privilege an attacker needs,
+				// which is the error direction that makes a real, reachable
+				// vulnerability look gated and get dismissed.
+				//
+				// Measured: this fallback produced 9 of the 16 remaining
+				// over-restrictions on a 148-CVE corpus, every one of them
+				// "truth unauthenticated, reported subscriber".
+				//
+				// A callback that delegates its real check elsewhere is still
+				// followed, because that is a case where the identity assertion
+				// exists and simply lives one call away.
+				if delegated := followCallbackDelegation(funcBody, fullFileContent, nil); delegated != models.Unauthenticated {
+					return callback, delegated
 				}
+				return callback, models.Unauthenticated
 			}
 
 			// PRIORITY 2: Check if callback name indicates admin-level permission check

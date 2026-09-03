@@ -575,7 +575,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 
 		// Apply auth heuristics
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -648,7 +648,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		action := resolveDynamicAction("$"+varName, content)
 
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -711,7 +711,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		action := resolveDynamicAction("$"+varName, content)
 
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -774,7 +774,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		action := resolveDynamicAction("$this->"+propName, content)
 
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -859,9 +859,20 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			}
 		}
 
-		// Apply admin heuristics
+		// Apply admin heuristics.
+		//
+		// isLikelyAdminAction is deliberately NOT consulted. It matches English
+		// verbs and nouns that occur in most action names -- save_, add_,
+		// edit_, delete_, dismiss, review, notice, option, setting, widget --
+		// and promoted 818 of 3478 logged-in AJAX endpoints across 143 plugins
+		// to Admin with no gating capability check anywhere in the file. A name
+		// is not a capability check, and over-stating the privilege is the
+		// error direction that makes a reachable vulnerability look gated.
+		//
+		// isAdminIndicatorAction stays: it matches names that quote an actual
+		// capability or role.
 		if authLevel == models.Subscriber {
-			if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+			if isAdminIndicatorAction(action) {
 				authLevel = models.Admin
 			}
 		}
@@ -1048,9 +1059,20 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			}
 		}
 
-		// Apply admin heuristics
+		// Apply admin heuristics.
+		//
+		// isLikelyAdminAction is deliberately NOT consulted. It matches English
+		// verbs and nouns that occur in most action names -- save_, add_,
+		// edit_, delete_, dismiss, review, notice, option, setting, widget --
+		// and promoted 818 of 3478 logged-in AJAX endpoints across 143 plugins
+		// to Admin with no gating capability check anywhere in the file. A name
+		// is not a capability check, and over-stating the privilege is the
+		// error direction that makes a reachable vulnerability look gated.
+		//
+		// isAdminIndicatorAction stays: it matches names that quote an actual
+		// capability or role.
 		if authLevel == models.Subscriber {
-			if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+			if isAdminIndicatorAction(action) {
 				authLevel = models.Admin
 			}
 		}
@@ -1450,7 +1472,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 
 		// Determine auth level
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -1514,7 +1536,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 
 		// Determine auth level
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -1598,7 +1620,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		if isNopriv {
 			authLevel = models.Unauthenticated
 			routePrefix = "wp_ajax_nopriv_"
-		} else if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		} else if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		} else {
 			authLevel = models.Subscriber
@@ -1648,7 +1670,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		// Elementor AJAX typically requires user authentication (nonce verified)
 		// Default to User level, upgrade to Admin if action name suggests admin
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -1691,7 +1713,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		}
 
 		// Upgrade to Admin if action name suggests admin functionality
-		if authLevel == models.Subscriber && (isAdminIndicatorAction(action) || isLikelyAdminAction(action)) {
+		if authLevel == models.Subscriber && isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -1783,7 +1805,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		if isNopriv {
 			authLevel = models.Unauthenticated
 			routePrefix = "wp_ajax_nopriv_"
-		} else if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		} else if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		} else {
 			authLevel = models.Subscriber
@@ -1830,7 +1852,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		// registerAjaxEndpoint typically registers wp_ajax_* (authenticated)
 		// Default to Subscriber level, upgrade to Admin if action name suggests admin
 		authLevel := models.Subscriber
-		if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+		if isAdminIndicatorAction(action) {
 			authLevel = models.Admin
 		}
 
@@ -1972,7 +1994,7 @@ func parseAJAXMatch(content string, match []int, filepath, pluginSlug string, is
 			// Strong indicators in action name
 			if isAdminIndicatorAction(action) {
 				authLevel = models.Admin
-			} else if isLikelyAdminAction(action) {
+			} else if isAdminIndicatorAction(action) {
 				// Use aggressive heuristics as fallback
 				authLevel = models.Admin
 			}
@@ -2455,7 +2477,7 @@ func DetectDirectAJAXHandlers(content, filepath string, pluginSlug string) []mod
 
 			// Apply admin heuristics if not already admin level
 			if authLevel != models.Admin {
-				if isAdminIndicatorAction(action) || isLikelyAdminAction(action) {
+				if isAdminIndicatorAction(action) {
 					authLevel = models.Admin
 				}
 			}
@@ -2605,7 +2627,7 @@ func detectWooCommerceStyleAJAX(content, filepath, pluginSlug string) []models.E
 			if isNopriv {
 				authLevel = models.Unauthenticated
 				routePrefix = "wp_ajax_nopriv_"
-			} else if isAdminIndicatorAction(fullAction) || isLikelyAdminAction(fullAction) {
+			} else if isAdminIndicatorAction(fullAction) {
 				authLevel = models.Admin
 			}
 
@@ -2745,7 +2767,7 @@ func detectInlineArrayForeachAJAX(content, filepath, pluginSlug string) []models
 			if isNopriv {
 				authLevel = models.Unauthenticated
 				routePrefix = "wp_ajax_nopriv_"
-			} else if isAdminIndicatorAction(fullAction) || isLikelyAdminAction(fullAction) {
+			} else if isAdminIndicatorAction(fullAction) {
 				authLevel = models.Admin
 			}
 

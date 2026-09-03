@@ -377,8 +377,27 @@ func DetectShortcodes(content, filepath, pluginSlug string) []models.Endpoint {
 			}
 		}
 
-		// All shortcodes are unauthenticated - they render in post content for any visitor
+		// A shortcode renders in post content, so its code path is reachable by
+		// any visitor -- that is the right default. It does not follow that the
+		// handler itself is ungated: a shortcode callback that opens with a
+		// capability check and stops when it fails requires that capability,
+		// and hardcoding Unauthenticated made those invisible. Measured before
+		// this change: 369 of 369 shortcode endpoints across 143 plugins were
+		// labelled unauthenticated, and any ground-truth file their file-level
+		// reach set touched inherited that level under min-aggregation.
+		//
+		// widget.go and block.go already infer from the callback body; this
+		// brings shortcodes into line. It is only safe because InferAuthLevel
+		// now requires a check to actually gate the body (see guard.go) -- with
+		// the older presence-based inference this would have reported Admin for
+		// any handler that merely mentioned a capability, turning an
+		// under-restriction into the more dangerous over-restriction.
 		authLevel := models.Unauthenticated
+		if callbackBody != "" {
+			if inferred := InferAuthLevel(callbackBody); inferred != models.Unauthenticated {
+				authLevel = inferred
+			}
+		}
 
 		// Format the route
 		route := "[" + routeTag + "]"
