@@ -1,5 +1,7 @@
 package ast
 
+import "sync"
+
 type ClassHierarchy struct {
 	Parents    map[string]string
 	Children   map[string][]string
@@ -7,6 +9,19 @@ type ClassHierarchy struct {
 	Traits     map[string][]string
 	MROCache   map[string][]string
 	symTable   *SymbolTable
+
+	// mroMu guards MROCache. One ClassHierarchy is built per plugin
+	// (analyzer.go:300) and shared by every per-file goroutine that
+	// AnalyzePlugin runs through its errgroup (analyzer.go:189-191), so the
+	// lazy write in getMRO races. Unsynchronised concurrent writes to a Go map
+	// are not merely lossy: the runtime detects them and kills the process with
+	// "fatal error: concurrent map writes", taking the host application down
+	// with it. Observed while analysing a corpus of 143 plugins.
+	//
+	// The other maps here are filled once in BuildClassHierarchy before the
+	// hierarchy is published to any goroutine and are read-only afterwards, so
+	// only MROCache needs guarding.
+	mroMu sync.RWMutex
 }
 
 func BuildClassHierarchy(st *SymbolTable) *ClassHierarchy {
@@ -130,15 +145,28 @@ func (h *ClassHierarchy) collectSubclasses(fqn string, result *[]string, visited
 
 // getMRO computes method resolution order: class → traits (decl order) → parent → recurse
 func (h *ClassHierarchy) getMRO(classFQN string) []string {
-	if cached, ok := h.MROCache[classFQN]; ok {
+	h.mroMu.RLock()
+	cached, ok := h.MROCache[classFQN]
+	h.mroMu.RUnlock()
+	if ok {
 		return cached
 	}
 
+	// buildMRO reads only the immutable maps, so it runs outside the lock;
+	// holding the write lock across it would serialise every goroutine on the
+	// first cache miss for no benefit. Two goroutines racing to compute the
+	// same MRO produce equal results, so the loser's value is simply discarded.
 	visited := make(map[string]bool)
 	var mro []string
 	h.buildMRO(classFQN, &mro, visited)
 
-	h.MROCache[classFQN] = mro
+	h.mroMu.Lock()
+	if existing, ok := h.MROCache[classFQN]; ok {
+		mro = existing
+	} else {
+		h.MROCache[classFQN] = mro
+	}
+	h.mroMu.Unlock()
 	return mro
 }
 
