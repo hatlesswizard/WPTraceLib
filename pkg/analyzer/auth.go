@@ -327,9 +327,40 @@ func InferAuthLevel(code string) models.AuthLevel {
 		return models.Unauthenticated
 	}
 
-	// 2. Check for capability checks - most reliable auth indicator
+	// 2. Capability checks -- but only the ones that actually gate this code.
+	//
+	// A capability check that appears in the body is not the same as one that
+	// protects it. A handler with an admin-only branch beside an unguarded
+	// vulnerable branch used to report Admin, which is the dangerous direction
+	// of error: a reachable vulnerability looked gated. FindCapabilityGuards
+	// distinguishes "fail the check and the request stops" from "the check
+	// decides one branch" and from "the result is assigned to a variable".
+	//
+	// When several checks each gate the whole body, the LOWEST wins: passing
+	// any one of them is enough to get in, so the weakest is what an attacker
+	// needs.
+	if gatingCaps, gated := StrongestGuard(code); gated {
+		best := models.AuthLevel(-1)
+		for _, c := range gatingCaps {
+			lvl, ok := resolveCapabilityLevel(c)
+			if !ok {
+				continue
+			}
+			if best < 0 || lvl < best {
+				best = lvl
+			}
+		}
+		if best >= 0 {
+			return best
+		}
+		// The body is gated, but by a capability held in a variable or constant
+		// that cannot be resolved statically. Something is required; Subscriber
+		// is the floor for "a logged-in user at minimum".
+		return models.Subscriber
+	}
+
 	capability := extractCapabilityCheck(code)
-	if capability != "" {
+	if capability != "" && !hasOnlyNonGatingCapabilityChecks(code) {
 		// Use configuration-based lookup
 		if level, ok := getCapabilityLevel(capability); ok {
 			return level
@@ -347,9 +378,10 @@ func InferAuthLevel(code string) models.AuthLevel {
 		return models.Subscriber
 	}
 
-	// 3. Check for admin-specific capability patterns
-	// NOTE: This no longer includes is_admin() - that checks location, not auth
-	if hasAdminCapabilityCheck(code) {
+	// 3. Admin-shaped assertions, subject to the same gating test. Without it a
+	// plugin that merely mentions manage_options in an unguarded branch reads
+	// as Admin.
+	if hasAdminCapabilityCheck(code) && !hasOnlyNonGatingCapabilityChecks(code) {
 		return models.Admin
 	}
 
@@ -1848,4 +1880,47 @@ func InferAuthLevelFromCallbackWithAST(callbackName string, fileContent string, 
 	}
 
 	return level
+}
+
+
+// resolveCapabilityLevel maps a capability string onto the ladder using the
+// same precedence InferAuthLevel has always used: configuration first, then the
+// built-in table, then the pattern heuristics for capabilities a plugin
+// generates at runtime.
+func resolveCapabilityLevel(capability string) (models.AuthLevel, bool) {
+	if capability == "" {
+		return 0, false
+	}
+	if level, ok := getCapabilityLevel(capability); ok {
+		return level, true
+	}
+	if level, ok := capabilityLevels[capability]; ok {
+		return level, true
+	}
+	if lvl := inferCapabilityAuthLevel(capability); lvl != models.Unauthenticated {
+		return lvl, true
+	}
+	// A capability nobody recognises still means a logged-in user.
+	return models.Subscriber, true
+}
+
+// hasOnlyNonGatingCapabilityChecks reports that no capability check present
+// gates the whole body.
+//
+// GuardBranch counts as non-gating here, and that is the point. A check that
+// protects one branch leaves every other path into the function open, and the
+// level an endpoint requires is the level of its cheapest path. Only
+// GuardFunction -- fail the check and the request stops -- constrains the
+// endpoint as a whole.
+func hasOnlyNonGatingCapabilityChecks(code string) bool {
+	guards := FindCapabilityGuards(code)
+	if len(guards) == 0 {
+		return false
+	}
+	for _, g := range guards {
+		if g.Kind == GuardFunction {
+			return false
+		}
+	}
+	return true
 }
