@@ -357,23 +357,20 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 	// Find class boundaries first
 	classRanges := findClassRanges(content)
 
-	// Find all function definitions
-	matches := funcDefPattern.FindAllStringSubmatchIndex(content, -1)
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
-		}
-
-		funcName := content[match[2]:match[3]]
-		startPos := match[0]
+	// Find all function definitions.
+	//
+	// FindFunctionDeclarations scans the parameter list with a balanced-delimiter
+	// walk instead of a regex. funcDefPattern's `\([^)]*\)` stopped at the first
+	// ")" inside the parameters, so every declaration with a default value like
+	// array() or a nested call was invisible -- 11,696 of 329,198 declarations
+	// across a 143-plugin corpus, and 26% of the functions in some plugins.
+	for _, decl := range FindFunctionDeclarations(content) {
+		funcName := decl.Name
+		startPos := decl.DeclStart
 		startLine := countNewlines(content[:startPos])
 
-		// Find the matching closing brace
-		bodyStart := match[1] - 1 // Position of opening brace
-		endPos := findMatchingBrace(content, bodyStart)
-		if endPos < 0 {
-			continue
-		}
+		bodyStart := decl.BodyOpen
+		endPos := decl.BodyClose
 		endLine := countNewlines(content[:endPos])
 
 		// Extract function body temporarily for call extraction
