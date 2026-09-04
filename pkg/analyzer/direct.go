@@ -149,15 +149,33 @@ func readDirectFile(path string) (string, bool) {
 		size = directMaxFileBytes
 	}
 
-	buf := make([]byte, size)
+	// The package's shared read buffer, as Analyzer.readFileContent uses it: the
+	// direct pass touches every PHP file in the tree, and an allocation per file
+	// is exactly the pattern the pool exists to avoid.
+	bufPtr := fileBufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	if int64(cap(buf)) < size {
+		buf = make([]byte, size)
+	} else {
+		buf = buf[:size]
+	}
+
 	n, err := io.ReadFull(f, buf)
-	if n <= 0 {
-		return "", false
-	}
 	if err != nil && err != io.ErrUnexpectedEOF {
+		*bufPtr = buf
+		fileBufferPool.Put(bufPtr)
 		return "", false
 	}
-	return string(buf[:n]), true
+	if n <= 0 {
+		*bufPtr = buf
+		fileBufferPool.Put(bufPtr)
+		return "", false
+	}
+
+	content := string(buf[:n])
+	*bufPtr = buf
+	fileBufferPool.Put(bufPtr)
+	return content, true
 }
 
 func analyzeDirectPHPFile(path, pluginDir, pluginSlug string) *models.Endpoint {
