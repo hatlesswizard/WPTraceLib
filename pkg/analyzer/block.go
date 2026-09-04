@@ -21,8 +21,12 @@ var (
 	// there is an endpoint is the second argument's render_callback, not how the
 	// first argument is spelled, so the call site is matched and its arguments
 	// are then parsed.
+	//
+	// The leading word boundary matters: without it the pattern also fires inside
+	// unregister_block_type(), and a block being REMOVED would be reported as an
+	// endpoint.
 	registerBlockCallPattern = regexp.MustCompile(
-		`register_block_type(?:_from_metadata)?\s*\(`,
+		`\bregister_block_type(?:_from_metadata)?\s*\(`,
 	)
 
 	// render_callback patterns

@@ -207,3 +207,15 @@ register_block_type( __DIR__ . '/blocks/counter' );
 		t.Errorf("endpoint = %v / %q", eps[0].AuthLevel, eps[0].Callback)
 	}
 }
+
+// unregister_block_type() removes a block. Matching the call name without a
+// leading word boundary fires inside it and reports the removal as an endpoint.
+func TestBlockUnregisterIsNotARegistration(t *testing.T) {
+	php := `<?php
+unregister_block_type( 'ns/gone' );
+unregister_block_type( 'ns/also-gone', array( 'render_callback' => 'rc' ) );
+`
+	if eps := DetectBlocks(php, "b.php", "p"); len(eps) != 0 {
+		t.Fatalf("want no endpoint, got %v", slashRoutes(eps))
+	}
+}
