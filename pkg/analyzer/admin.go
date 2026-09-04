@@ -804,17 +804,26 @@ func parseBalancedArgs(content string, startPos int) []string {
 	for i := startPos; i < len(content); i++ {
 		char := content[i]
 
-		// Handle string literals
+		// Handle string literals.
+		//
+		// The escape test is "the character before this quote is not a
+		// backslash", and a quote at offset 0 has no character before it, so it
+		// cannot be escaped. Written as i > 0 the test silently declined to OPEN
+		// a literal that began the parsed region: every comma after it then
+		// looked like it was inside a string, and the whole argument list came
+		// back as one element. Callers that pass startPos just after a "(" never
+		// see it, because offset 0 is then never reached; a caller parsing a bare
+		// argument list does.
 		if char == '\'' && !inDoubleQuote {
 			// Check for escaped quote
-			if i > 0 && content[i-1] != '\\' {
+			if i == 0 || content[i-1] != '\\' {
 				inSingleQuote = !inSingleQuote
 			}
 			currentArg.WriteByte(char)
 			continue
 		}
 		if char == '"' && !inSingleQuote {
-			if i > 0 && content[i-1] != '\\' {
+			if i == 0 || content[i-1] != '\\' {
 				inDoubleQuote = !inDoubleQuote
 			}
 			currentArg.WriteByte(char)
