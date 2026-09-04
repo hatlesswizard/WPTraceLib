@@ -89,30 +89,46 @@ func TestCoreCapabilityLevelsMatchPopulateRoles(t *testing.T) {
 	}
 }
 
-// TestExistIsUnauthenticated pins the one capability that resolves below the
-// Subscriber floor, and pins the bound alongside it.
-func TestExistIsUnauthenticated(t *testing.T) {
+// TestExistStaysAtSubscriber pins a decision that measurement forced, against
+// the reading of core that would otherwise apply.
+//
+// WP_User::has_cap() sets $capabilities['exist'] = true unconditionally, so an
+// anonymous visitor passes current_user_can('exist') and the capability gates
+// nothing. Moving it to CoreUnauthenticated on that reading was measured and it
+// made things worse: the only occurrence of 'exist' in the 143 trees is a menu
+// capability -- buddypress 14.3.3 registers an admin submenu page with it -- and
+// the admin-page path in pkg/analyzer defaults a capability it cannot find to
+// Admin, taking that endpoint from an exactly correct subscriber to admin.
+//
+// Subscriber is also the better single answer for as long as one number serves
+// both uses: wp-admin/admin.php calls auth_redirect() before any page renders,
+// so Subscriber is exact for a menu capability that gates nothing.
+func TestExistStaysAtSubscriber(t *testing.T) {
 	cfg := New()
 
-	// WP_User::has_cap() sets $capabilities['exist'] = true unconditionally --
-	// "Everyone is allowed to exist." -- before testing the required caps, so the
-	// WP_User(0) handed to an anonymous visitor passes current_user_can('exist').
 	level, ok := cfg.GetCapabilityLevel("exist")
 	if !ok {
 		t.Fatal("exist should be found in the table")
 	}
-	if level != models.Unauthenticated {
-		t.Errorf("exist: got %s, want unauthenticated", level)
+	if level != models.Subscriber {
+		t.Errorf("exist: got %s, want subscriber; see the note in capabilities.go", level)
 	}
 
-	// The bound: 'read' is the capability populate_roles_160() grants to the
-	// subscriber role, and it must NOT follow 'exist' below the floor.
-	level, ok = cfg.GetCapabilityLevel("read")
-	if !ok {
-		t.Fatal("read should be found in the table")
+	// The bound on the mechanism that was built for it: CoreUnauthenticated is
+	// wired through the merged index, so a caller that does populate it gets
+	// Unauthenticated with ok=true rather than a miss.
+	custom := &Config{
+		Capabilities: &CapabilityConfig{
+			CoreUnauthenticated: []string{"gates_nothing"},
+			CoreSubscriber:      []string{"read"},
+		},
 	}
-	if level != models.Subscriber {
-		t.Errorf("read: got %s, want subscriber", level)
+	level, ok = custom.GetCapabilityLevel("gates_nothing")
+	if !ok {
+		t.Fatal("a CoreUnauthenticated capability should be found, not missed")
+	}
+	if level != models.Unauthenticated {
+		t.Errorf("gates_nothing: got %s, want unauthenticated", level)
 	}
 }
 

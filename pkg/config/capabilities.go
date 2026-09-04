@@ -291,6 +291,29 @@ func wordPressCoreSubscriberCapabilities() []string {
 		"read",
 		"level_0",
 
+		// 'exist' is not a role capability at all: WP_User::has_cap() sets
+		// $capabilities['exist'] = true unconditionally -- "Everyone is allowed
+		// to exist." -- before testing the required caps, so even the WP_User(0)
+		// handed to an anonymous visitor passes current_user_can('exist'). By that
+		// reading it belongs in CoreUnauthenticated.
+		//
+		// It stays here because moving it was measured and made things worse. The
+		// only occurrence of 'exist' in the 143 trees is a MENU capability, not a
+		// current_user_can argument: buddypress 14.3.3 registers
+		// add_submenu_page( 'profile.php', ..., 'exist', 'bp-profile-edit', ... ).
+		// The admin-page path in pkg/analyzer looks a menu capability up in its own
+		// map and defaults an unknown one to Admin, so moving 'exist' out of these
+		// six lists took that endpoint from an exactly correct subscriber to admin
+		// -- five levels of over-restriction on a real tree, which is the one thing
+		// this work must not do.
+		//
+		// Subscriber is also the better single answer while one number has to serve
+		// both uses. wp-admin/admin.php calls auth_redirect() before any page
+		// renders, so an admin page whose capability gates nothing still needs a
+		// logged-in caller: Subscriber is exact there, and one level high for a
+		// bare current_user_can('exist'), which occurs nowhere in the corpus.
+		"exist",
+
 		// Meta capabilities (singular forms) - reading is subscriber level
 		"read_post", // Meta cap: reading posts requires basic login
 		"read_page", // Meta cap: reading pages requires basic login
@@ -298,21 +321,17 @@ func wordPressCoreSubscriberCapabilities() []string {
 }
 
 // wordPressCoreUnauthenticatedCapabilities returns capabilities a logged-out
-// visitor passes. A check on one of these gates nothing at all.
+// visitor passes, so that a check on one of them gates nothing.
+//
+// It is empty. WordPress has exactly one such capability, 'exist', and it is
+// parked in the Subscriber list instead -- see the note there for the
+// measurement that forced that. The list exists because the concept is real
+// and because a caller's own configuration may need to express it. Before
+// 'exist' can move here, pkg/analyzer has to stop treating a capability it
+// cannot find in its own map as Admin, and has to build that map from this
+// list too.
 func wordPressCoreUnauthenticatedCapabilities() []string {
-	return []string{
-		// WP_User::has_cap() sets `$capabilities['exist'] = true;` unconditionally,
-		// under the comment "Everyone is allowed to exist.", before it tests the
-		// required caps. current_user_can('exist') is therefore true for the
-		// WP_User(0) that wp_get_current_user() hands an anonymous visitor, so it
-		// asserts nothing about the caller.
-		//
-		// It appears in 0 of the 143 measured plugin trees, so this row is a
-		// correctness statement rather than a measured win. It is also the only
-		// row in the table that can carry a gated function BELOW the Subscriber
-		// floor, so it is the one to watch on a future corpus.
-		"exist",
-	}
+	return []string{}
 }
 
 // capabilityIndex is the single merged capability-to-level table derived from the
