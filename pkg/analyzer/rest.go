@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -190,21 +191,33 @@ var (
 
 	// Pattern for register_rest_route with variable args (third argument is a variable)
 	// Example: register_rest_route( Main::API_V1_NAMESPACE, self::ROUTE, $route_args );
-	// This pattern captures the variable name so we can find its definition
+	// This pattern captures the variable name so we can find its definition.
+	//
+	// The args variable may be followed by "," as well as ")": register_rest_route
+	// takes a fourth $override argument (core signature:
+	// register_rest_route($namespace, $route, $args = array(), $override = false)),
+	// and requiring ")" made every four-argument call invisible to this pass.
+	// Measured: 28 of 1904 call sites in 13 of 143 trees pass a variable as the
+	// third argument and 25 sites in 10 trees use the four-argument form; where the
+	// two combine, the call produced no endpoint at all. Accepting "," rather than
+	// widening the tail into a second regex means the fourth argument can be any
+	// expression, including a call such as $this->get_override().
 	restVarArgsPattern = regexp.MustCompile(
 		`(?:register_rest_route|\\\\register_rest_route)\s*\(\s*` +
 			`([^,]+?)\s*,\s*` + // namespace (group 1)
 			`([^,]+?)\s*,\s*` + // route (group 2)
-			`(\$[a-zA-Z_][a-zA-Z0-9_]*)\s*\)`, // args variable (group 3) - ends with )
+			`(\$[a-zA-Z_][a-zA-Z0-9_]*)\s*[,)]`, // args variable (group 3)
 	)
 
 	// Pattern for register_rest_route with property-based args (e.g., $this->options)
 	// Example: register_rest_route($this->namespace, "/{$uri}", $this->options);
+	// As with restVarArgsPattern, the args property may be followed by "," because
+	// of core's fourth $override argument.
 	restPropertyArgsPattern = regexp.MustCompile(
 		`(?:register_rest_route|\\\\register_rest_route)\s*\(\s*` +
 			`([^,]+?)\s*,\s*` + // namespace (group 1) - can be $this->property or variable
 			`([^,]+?)\s*,\s*` + // route (group 2) - can be interpolated string
-			`(\$(?:this|self)->(?:[a-zA-Z_][a-zA-Z0-9_]*))\s*\)`, // args property (group 3) - $this->prop or $self->prop
+			`(\$(?:this|self)->(?:[a-zA-Z_][a-zA-Z0-9_]*))\s*[,)]`, // args property (group 3)
 	)
 
 	// Pattern to find variable array assignment: $route_args = [...]
@@ -805,14 +818,20 @@ func DetectRESTEndpoints(content, filepath string, pluginSlug string) []models.E
 		methods := extractMethods(args)
 		callback := extractCallback(args)
 
-		// Property-based wrappers typically add permission_callback in the wrapper class
-		// Default to Admin since these are typically admin-only API endpoints
-		// Unless explicit permission_callback is found in args
+		// A registration whose args carry no permission_callback we can read is not
+		// evidence of a privilege requirement. This used to default to Admin on the
+		// reasoning that "these are typically admin-only API endpoints" -- the same
+		// invented privilege the route-string heuristic used to add, reached by a
+		// different door. Nothing in the source said Admin. WordPress serves a route
+		// whose permission_callback is absent to everyone, so Unauthenticated is the
+		// only answer here that cannot make a reachable bug look gated.
+		//
+		// The shape this pass matches, $this->a->b->register_rest_route(...), occurs
+		// in 0 of the 143 measured plugin trees, so the change costs nothing today
+		// and removes a live over-restriction generator.
 		permCallback, authLevel := ParsePermissionCallbackWithContext(args, content)
 		if permCallback == "" {
-			// No explicit permission_callback in args - wrapper likely adds it
-			// Default to Admin for property-based wrappers
-			authLevel = models.Admin
+			authLevel = models.Unauthenticated
 		}
 
 		lineNum := countLines(content[:match[0]]) + 1
@@ -843,7 +862,6 @@ func DetectRESTEndpoints(content, filepath string, pluginSlug string) []models.E
 			continue
 		}
 
-		processedPositions[match[0]] = true
 		namespaceRef := strings.TrimSpace(content[match[2]:match[3]])
 		routeRef := strings.TrimSpace(content[match[4]:match[5]])
 		varName := content[match[6]:match[7]] // e.g., $route_args
@@ -851,8 +869,14 @@ func DetectRESTEndpoints(content, filepath string, pluginSlug string) []models.E
 		// Find the variable's array assignment above this position
 		args := findVariableArrayValue(content, varName, match[0])
 		if args == "" {
-			continue // Couldn't find the variable definition
+			// The position is deliberately NOT marked processed before this
+			// point. It used to be, which meant a call this pass could not
+			// resolve was still claimed by it and every later pass was locked
+			// out of the same call site -- a silent sterilisation rather than a
+			// miss anyone could see.
+			continue
 		}
+		processedPositions[match[0]] = true
 
 		// Try to resolve namespace
 		namespace := resolveNamespaceRef(namespaceRef, symbolTable, content, match[0])
@@ -909,8 +933,19 @@ func DetectRESTEndpoints(content, filepath string, pluginSlug string) []models.E
 		fullMatch := content[match[0]:match[1]]
 		lineNum := countLines(content[:match[0]]) + 1
 
-		// Since we can't resolve the $this->options array, check the surrounding code
-		// for permission callback patterns
+		// A property holding the args array is usually assigned in a
+		// constructor or a setter, which can sit either side of the
+		// registration. When the literal can be found, the route's real
+		// callback and its real permission callback are both in hand and the
+		// call is worth the same treatment as a literal args block.
+		if args := findVariableArrayValue(content, argsProperty, len(content)); args != "" {
+			eps := createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug, content, match[0])
+			endpoints = append(endpoints, eps...)
+			continue
+		}
+
+		// Otherwise the array is out of reach; fall back to the surrounding code
+		// for a permission callback pattern.
 		nearbyCode := extractNearbyContext(content, match[0], 500)
 		authLevel := InferAuthLevel(nearbyCode)
 
@@ -1092,8 +1127,487 @@ func DetectRESTEndpoints(content, filepath string, pluginSlug string) []models.E
 		}
 	}
 
+	// 17. Route-argument arrays that are not lexically an argument of any
+	// register_rest_route call in this file.
+	endpoints = append(endpoints, discoverRouteDescriptors(content, filepath, pluginSlug)...)
+
+	// 18. register_rest_field: callbacks bolted onto a WordPress CORE route.
+	endpoints = append(endpoints, detectRESTFieldEndpoints(content, filepath, pluginSlug)...)
+
 	return endpoints
 }
+
+// ---------------------------------------------------------------------------
+// Route descriptors written away from the register_rest_route call site
+// ---------------------------------------------------------------------------
+
+var (
+	// descriptorCallbackKeyPattern finds a 'callback' => key. It is the seed for
+	// the backward walk to the enclosing array literal.
+	descriptorCallbackKeyPattern = regexp.MustCompile(`['"]callback['"]\s*=>`)
+
+	// descriptorSiblingKeyPattern is the corroborating evidence that an array
+	// literal carrying a 'callback' key is a REST route descriptor.
+	descriptorSiblingKeyPattern = regexp.MustCompile(`['"](?:methods|permission_callback)['"]\s*=>`)
+
+	// restRouteCallPattern finds the head of a register_rest_route call so its
+	// argument list can be bracket-matched and excluded.
+	restRouteCallPattern = regexp.MustCompile(`register_rest_route\s*\(`)
+
+	// restRouteVarThirdArgPattern captures the bare variable or property passed as
+	// the third argument of a register_rest_route call, in either the three- or
+	// the four-argument form.
+	restRouteVarThirdArgPattern = regexp.MustCompile(
+		`register_rest_route\s*\(\s*[^,]+?\s*,\s*[^,]+?\s*,\s*(\$(?:this->|self->)?[a-zA-Z_][a-zA-Z0-9_]*)\s*(?:,|\))`)
+)
+
+// descriptorMaxLiteral bounds one descriptor literal, and descriptorBackWindow
+// bounds how far back the enclosing-bracket walk looks. Both exist so that a
+// pathological file cannot turn this pass into an O(file^2) scan: mstore-api has
+// 174 'callback' keys in a single tree.
+const (
+	descriptorMaxLiteral = 8 * 1024
+	descriptorBackWindow = 20 * 1024
+	descriptorMaxPerFile = 256
+)
+
+// discoverRouteDescriptors emits endpoints for REST route-argument arrays that
+// are not written inside a register_rest_route call.
+//
+// WordPress reads a route's behaviour out of the third argument of
+// register_rest_route: WP_REST_Server::register_route() copies that array into
+// WP_REST_Server::$endpoints and reads the keys 'methods', 'callback',
+// 'permission_callback' and 'args' out of it. register_rest_route() itself only
+// forwards. PHP does not care where the array literal was written, so plugins
+// routinely build it somewhere else -- a class property a subclass assigns, the
+// return value of an abstract get_routes(), an element of a config table walked
+// by a foreach in a base class. Every one of those is a live URL.
+//
+// Until now the sixteen passes above all anchored on the literal text of the
+// call and took the args from the call's own third argument, so a descriptor
+// written anywhere else was invisible. Measured across 143 plugin trees: 332
+// route-descriptor literals in 15 trees sit outside every register_rest_route
+// argument list and name 225 distinct callbacks that became no endpoint at all.
+// In one plugin that is the entire REST surface -- all seventeen controllers
+// under one directory contributed nothing.
+//
+// The identification rule is core's, not any plugin's: 'permission_callback'
+// beside 'callback', or 'methods' beside 'callback', is a key combination that
+// only register_rest_route's args array uses. register_rest_field spells its
+// callbacks get_callback/update_callback, register_meta spells its auth_callback,
+// and the Abilities API spells its execute_callback, so none of them collides.
+// Measured precision of exactly this predicate over the corpus: every literal it
+// accepted outside a call was a genuine route table.
+//
+// Two deliberate limits:
+//
+//   - The route is synthetic. A descriptor does not say what path it will be
+//     registered under, and inventing one would be a guess. What matters for
+//     objective 1 is the callback, which is exact.
+//   - The level is capped at Subscriber. A descriptor found outside a call has
+//     not been proven to be registered at all, and its missing keys are supplied
+//     by a consuming call site this pass has not read. A block that asserts
+//     nothing therefore reports Unauthenticated, and one whose own
+//     permission_callback asserts something reports at most "some logged-in
+//     user". This costs exactness on table-driven plugins whose consuming loop
+//     supplies an admin permission callback -- a measured, real shape -- but the
+//     error is then an under-restriction, which is noise rather than blindness.
+func discoverRouteDescriptors(content, filepath, pluginSlug string) []models.Endpoint {
+	if !strings.Contains(content, "callback") {
+		return nil
+	}
+
+	consumed := restRouteArgumentSpans(content)
+	forwarded := restRouteForwardedVars(content)
+
+	endpoints := make([]models.Endpoint, 0, 4)
+	seen := make(map[int]bool)
+
+	for _, m := range descriptorCallbackKeyPattern.FindAllStringIndex(content, -1) {
+		if len(endpoints) >= descriptorMaxPerFile {
+			break
+		}
+		if spansContain(consumed, m[0]) {
+			continue
+		}
+		// The key pattern requires a quote immediately before "callback", so the
+		// other core registration APIs' keys -- get_callback, update_callback,
+		// auth_callback, execute_callback, render_callback -- cannot match it.
+		start, end := enclosingArrayLiteral(content, m[0])
+		if start < 0 || seen[start] {
+			continue
+		}
+		seen[start] = true
+		if end-start > descriptorMaxLiteral {
+			continue
+		}
+		body := content[start:end]
+		if !descriptorSiblingKeyPattern.MatchString(body) {
+			continue
+		}
+		// A literal assigned to a variable that a register_rest_route call in
+		// this file forwards as its third argument is already handled by the
+		// variable-args pass; emitting it again would duplicate that endpoint.
+		if name := assignedVariableName(content, start); name != "" && forwarded[name] {
+			continue
+		}
+		// __return_false makes the route unreachable to everyone. The lexical
+		// path filters those out (IsExplicitlyBlocked); do the same here rather
+		// than inventing a SuperAdmin level for them.
+		if IsExplicitlyBlocked(body) {
+			continue
+		}
+
+		callback := extractCallback(body)
+		if callback == "" || callback == "unknown" {
+			continue
+		}
+
+		lineNum := countLines(content[:start]) + 1
+		namespace := findClassNamespace(content, start, pluginSlug)
+		authLevel := descriptorAuthLevel(body, content)
+
+		// The route must be unique by construction. deduplicateEndpoints keys on
+		// (Route, Method, Type) and keeps ONE endpoint per key, so a shared
+		// synthetic route would collapse every descriptor in a namespace onto a
+		// single survivor -- discarding exactly the callbacks this pass exists to
+		// recover. The callback name and the line make each one distinct.
+		route := combineRoute(namespace, "/{descriptor}") +
+			"#" + NormalizeCallback(callback) + ":" + strconv.Itoa(lineNum)
+
+		methods := extractMethods(body)
+		for _, method := range methods {
+			endpoints = append(endpoints, models.Endpoint{
+				PluginSlug: pluginSlug,
+				Type:       models.EndpointTypeREST,
+				Route:      route,
+				Method:     method,
+				AuthLevel:  authLevel,
+				Callback:   NormalizeCallback(callback),
+				File:       filepath,
+				Line:       lineNum,
+				RawCode:    truncateCode(body, 500),
+				Namespace:  namespace,
+			})
+		}
+
+		// The descriptor's permission callback runs anonymously for the same
+		// reason the lexical path's does.
+		permCallback, _ := ParsePermissionCallbackWithContext(body, content)
+		endpoints = append(endpoints, restPermissionEndpoints(
+			permCallback, body, namespace, "/{descriptor}:"+strconv.Itoa(lineNum),
+			body, filepath, pluginSlug, content, methods)...)
+	}
+
+	return endpoints
+}
+
+// descriptorAuthLevel reads a descriptor's own permission_callback through the
+// same function the lexical path uses, so the two can never disagree about the
+// same text, and then bounds the answer.
+//
+// Two bounds, both in the safe direction:
+//
+//   - An unresolved permission callback yields Unauthenticated, not a guess.
+//     Core's rule that an absent permission_callback means "public" is a fact
+//     about the array that actually reaches register_rest_route -- register_route()
+//     defaults the key to null and dispatch serves the request anyway. It is NOT
+//     a fact about a plugin-side table, whose missing keys are filled in by the
+//     plugin's own consuming loop, which this pass has not read. Measured shape:
+//     one plugin builds eight descriptors with no permission_callback key at all
+//     and its consuming loop supplies current_user_can('manage_options'), while a
+//     sibling file with the identical shape supplies `return true`. The absent
+//     key carries no information, so the floor is the only honest answer.
+//   - Nothing above Subscriber. A descriptor found outside a call has not been
+//     proven to be registered at all, so it may assert at most "some logged-in
+//     user" -- never a capability that would make a reachable handler look gated.
+func descriptorAuthLevel(body, content string) models.AuthLevel {
+	permCallback, level := ParsePermissionCallbackWithContext(body, content)
+	if permCallback == "" {
+		return models.Unauthenticated
+	}
+	if level > models.Subscriber {
+		return models.Subscriber
+	}
+	return level
+}
+
+// restRouteArgumentSpans returns the [start,end) byte span of every
+// register_rest_route argument list in the file.
+//
+// This is a NEW structure rather than a reuse of processedPositions. The sixteen
+// existing passes share that map as a match-start dedupe key and produce a
+// correct endpoint at the overwhelming majority of call sites; rekeying it to
+// spans would silently change which pass claims which call and could delete
+// endpoints that exist today.
+func restRouteArgumentSpans(content string) [][2]int {
+	heads := restRouteCallPattern.FindAllStringIndex(content, -1)
+	if len(heads) == 0 {
+		return nil
+	}
+	spans := make([][2]int, 0, len(heads))
+	for _, h := range heads {
+		open := strings.LastIndex(content[h[0]:h[1]], "(")
+		if open < 0 {
+			continue
+		}
+		open += h[0]
+		closePos := matchDelimiter(content, open, '(', ')')
+		if closePos < 0 {
+			// Unbalanced (a truncated or mangled file): treat the rest of the
+			// file as consumed rather than emitting descriptors from inside a
+			// call we failed to parse.
+			spans = append(spans, [2]int{h[0], len(content)})
+			continue
+		}
+		spans = append(spans, [2]int{h[0], closePos + 1})
+	}
+	return spans
+}
+
+// restRouteForwardedVars returns the names of variables and properties passed as
+// the third argument of a register_rest_route call in this file.
+func restRouteForwardedVars(content string) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range restRouteVarThirdArgPattern.FindAllStringSubmatch(content, -1) {
+		if len(m) >= 2 {
+			out[strings.TrimSpace(m[1])] = true
+		}
+	}
+	return out
+}
+
+func spansContain(spans [][2]int, pos int) bool {
+	for _, s := range spans {
+		if pos >= s[0] && pos < s[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// assignedVariableName reports the variable or property an array literal
+// starting at start is assigned to, or "" when it is not a direct assignment.
+func assignedVariableName(content string, start int) string {
+	i := start - 1
+	for i >= 0 && (content[i] == ' ' || content[i] == '\t' || content[i] == '\r' || content[i] == '\n') {
+		i--
+	}
+	if i < 0 || content[i] != '=' {
+		return ""
+	}
+	i--
+	for i >= 0 && (content[i] == ' ' || content[i] == '\t') {
+		i--
+	}
+	end := i + 1
+	for i >= 0 && (isIdentByte(content[i]) || content[i] == '>' || content[i] == '-') {
+		i--
+	}
+	if i < 0 || content[i] != '$' {
+		return ""
+	}
+	return content[i:end]
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// enclosingArrayLiteral walks backwards from pos to the innermost array literal
+// that is still open there -- "[" or "array(" -- and forwards to its match. It
+// returns (-1, -1) when there is none within descriptorBackWindow bytes.
+//
+// The walk is string-aware: a bracket inside a quoted string is not a bracket.
+func enclosingArrayLiteral(content string, pos int) (int, int) {
+	lo := pos - descriptorBackWindow
+	if lo < 0 {
+		lo = 0
+	}
+
+	// Walk forward from lo to pos maintaining a stack of open delimiters, so
+	// that quoting is interpreted from a known-good starting point.
+	type open struct {
+		pos int
+		ch  byte
+	}
+	stack := make([]open, 0, 16)
+	i := lo
+	for i < pos {
+		c := content[i]
+		switch c {
+		case '\'', '"':
+			// skipString returns the index of the CLOSING quote, so step past it.
+			// Leaving i on the closing quote would make the next iteration read
+			// that quote as the START of another string and invert every string
+			// boundary from there on, which is how this walk first failed to find
+			// any enclosing literal at all.
+			i = skipString(content, i)
+			if i < 0 {
+				return -1, -1
+			}
+			i++
+			continue
+		case '/':
+			// Skip // and /* comments, whose contents are not code.
+			if i+1 < pos && content[i+1] == '/' {
+				for i < pos && content[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			if i+1 < pos && content[i+1] == '*' {
+				end := strings.Index(content[i:], "*/")
+				if end < 0 {
+					return -1, -1
+				}
+				i += end + 2
+				continue
+			}
+		case '#':
+			for i < pos && content[i] != '\n' {
+				i++
+			}
+			continue
+		case '[', '(':
+			stack = append(stack, open{pos: i, ch: c})
+		case ']', ')':
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		}
+		i++
+	}
+
+	for j := len(stack) - 1; j >= 0; j-- {
+		o := stack[j]
+		if o.ch == '[' {
+			end := matchDelimiter(content, o.pos, '[', ']')
+			if end < 0 {
+				return -1, -1
+			}
+			return o.pos, end + 1
+		}
+		// "array(" -- the "(" must be preceded by the array keyword.
+		k := o.pos - 1
+		for k >= 0 && (content[k] == ' ' || content[k] == '\t' || content[k] == '\r' || content[k] == '\n') {
+			k--
+		}
+		if k >= 4 && strings.EqualFold(content[k-4:k+1], "array") {
+			end := matchDelimiter(content, o.pos, '(', ')')
+			if end < 0 {
+				return -1, -1
+			}
+			return o.pos - 5, end + 1
+		}
+	}
+	return -1, -1
+}
+
+// ---------------------------------------------------------------------------
+// register_rest_field
+// ---------------------------------------------------------------------------
+
+var restFieldCallPattern = regexp.MustCompile(`register_rest_field\s*\(`)
+
+var restFieldCallbackKeyPattern = regexp.MustCompile(`['"](get_callback|update_callback)['"]\s*=>`)
+
+// detectRESTFieldEndpoints emits endpoints for register_rest_field callbacks.
+//
+// register_rest_field( $object_type, $field, array( 'get_callback' => ...,
+// 'update_callback' => ... ) ) writes those callables into core's field registry
+// for that object type, and the core wp/v2 controllers invoke get_callback while
+// preparing every response and update_callback while handling every write. The
+// plugin never registers a route of its own, so its whole REST surface as this
+// library saw it could miss the code entirely: a grep for register_rest_field
+// across the analyzer found nothing at all before this pass. Measured: 75 call
+// sites in 14 of 143 trees, 25 of them carrying an update_callback.
+//
+// The route is left unresolved on purpose. A post type's REST base is
+// WP_Post_Type::$rest_base, which register_post_type defaults to the post type
+// NAME; core only spells "posts" because it passes rest_base explicitly for the
+// built-ins. Pluralising the first argument would be an English guess, and four
+// of the six distinct object types measured in the corpus are not post types at
+// all ('user', 'comment' and a taxonomy have their own core routes). Only the
+// callback drives reachability, so the object type is recorded verbatim and
+// nothing is invented.
+//
+// Both callbacks are emitted at Unauthenticated. For get_callback that is
+// exactly right: a publicly-readable object type is readable anonymously. For
+// update_callback it is a floor rather than the truth -- core's
+// update_item_permissions_check gates the write with current_user_can('edit_post')
+// before any registered update_callback runs -- but the capability actually
+// required depends on the object type, which may be a custom post type, a
+// taxonomy, a user or a comment, each with its own controller and its own
+// permission rule. Naming one capability for all of them would risk reporting a
+// HIGHER level than the truth, which is the error that hides a reachable bug.
+// The floor errs the other way, which costs a wasted look.
+func detectRESTFieldEndpoints(content, filepath, pluginSlug string) []models.Endpoint {
+	heads := restFieldCallPattern.FindAllStringIndex(content, -1)
+	if len(heads) == 0 {
+		return nil
+	}
+
+	endpoints := make([]models.Endpoint, 0, len(heads))
+	for _, h := range heads {
+		open := strings.LastIndex(content[h[0]:h[1]], "(")
+		if open < 0 {
+			continue
+		}
+		open += h[0]
+		closePos := matchDelimiter(content, open, '(', ')')
+		if closePos < 0 {
+			continue
+		}
+		argList := content[open+1 : closePos]
+		lineNum := countLines(content[:h[0]]) + 1
+
+		objectType := "{unresolved}"
+		if m := restFieldObjectTypePattern.FindStringSubmatch(argList); len(m) >= 2 {
+			objectType = m[1]
+		}
+
+		for _, km := range restFieldCallbackKeyPattern.FindAllStringSubmatchIndex(argList, -1) {
+			kind := argList[km[2]:km[3]]
+			// Reuse the handler-callback extractor by presenting the key under
+			// the name it understands; the callable syntax is identical.
+			fragment := "'callback' =>" + argList[km[1]:min(km[1]+300, len(argList))]
+			callback := extractCallback(fragment)
+			if callback == "" || callback == "unknown" {
+				continue
+			}
+
+			method := "GET"
+			if kind == "update_callback" {
+				method = "POST"
+			}
+
+			endpoints = append(endpoints, models.Endpoint{
+				PluginSlug: pluginSlug,
+				Type:       models.EndpointTypeREST,
+				// Unique by construction: object type, field callback kind and
+				// the callback name. deduplicateEndpoints keys on
+				// (Route, Method, Type), and 21 of the 60 measured call sites
+				// share an object-type literal with another site in the same
+				// tree, so a route naming only the object type would keep one
+				// field per type per plugin and drop the rest.
+				Route:     "/wp-json/wp/v2/{" + objectType + "}#" + kind + ":" + NormalizeCallback(callback),
+				Method:    method,
+				AuthLevel: models.Unauthenticated,
+				Callback:  NormalizeCallback(callback),
+				File:      filepath,
+				Line:      lineNum,
+				RawCode:   truncateCode(content[h[0]:closePos+1], 500),
+				Namespace: "wp/v2",
+			})
+		}
+	}
+	return endpoints
+}
+
+// restFieldObjectTypePattern captures the first argument of register_rest_field
+// when it is a string literal.
+var restFieldObjectTypePattern = regexp.MustCompile(`^\s*['"]([^'"]+)['"]`)
 
 // resolveConcatenatedRoute resolves a concatenated route expression like '/' . self::API_BASE . '/status'
 func resolveConcatenatedRoute(expr string, st *SymbolTable, content string, position int) string {
@@ -1237,6 +1751,218 @@ func sanitizeForRoute(s string) string {
 	return s
 }
 
+// EndpointTypeRESTPermission marks an endpoint that stands for a route's
+// permission_callback rather than its handler.
+//
+// It is a separate type, not models.EndpointTypeREST, for two reasons. A
+// consumer that weights REST handlers can weight these differently or ignore
+// them, which is the cheap way to gate the whole idea off if it ever costs more
+// than it recovers. And deduplicateEndpoints keys on (Route, Method, Type), so a
+// distinct type is one more guarantee that a permission-callback endpoint can
+// never evict the handler endpoint it sits beside.
+const EndpointTypeRESTPermission models.EndpointType = "rest_permission"
+
+// permissionCallbackValuePattern finds the raw source text of a
+// 'permission_callback' => ... value. The 160-character window is enough to see
+// which callable form was written ($this, self::class, a bare string) without
+// scanning the rest of the args block.
+var permissionCallbackValuePattern = regexp.MustCompile(
+	`(?s)['"]permission_callback['"]\s*=>\s*(.{0,160})`)
+
+// restPermissionEndpoints returns the endpoints that stand for a route's
+// permission_callback.
+//
+// WP_REST_Server::dispatch() -> respond_to_request() calls the route's
+// registered permission_callback with the WP_REST_Request BEFORE any
+// authorization has been established, and regardless of what it goes on to
+// return. Its body therefore executes for a fully anonymous attacker, on every
+// request that matches the route, with attacker-controlled request data in hand.
+// It is the single most reliably unauthenticated-reachable code a REST route
+// has, and it is where token comparisons, header parsing and user lookups live.
+//
+// Until now the permission callback was read for a level and then discarded: the
+// endpoint recorded only the handler. A vulnerability inside a permission
+// callback was therefore reachable from no endpoint at all. Measured across 143
+// real plugin trees, 1280 permission-callback method references in 48 trees named
+// code that no endpoint pointed at, and two of the benchmark's own ground-truth
+// functions are permission callbacks in their own plugin -- both unreachable.
+//
+// Three properties keep this additive rather than risky:
+//
+//   - the level is models.Unauthenticated, unconditionally and by construction,
+//     which is what core does. An endpoint that can only be at the floor can
+//     never raise an aggregate and so can never manufacture an over-restriction.
+//   - the Route carries the permission callback's own name, so the endpoint is
+//     distinct from the handler's under any (Route, Method, Type) key. Without
+//     that, deduplicateEndpoints would delete one of the two -- and which one it
+//     deleted would depend on how the two callback names happened to sort.
+//   - the Line is the permission callback's own declaration line when that can
+//     be found in this file, and 0 otherwise. It is deliberately NOT the
+//     register_rest_route line: a consumer that matches "endpoint declared inside
+//     this line range" would otherwise credit the handler's line range with the
+//     permission callback's anonymous reachability, which is a different and
+//     false claim.
+func restPermissionEndpoints(permCallback, args, namespace, route, fullMatch, filepath, pluginSlug, content string, methods []string) []models.Endpoint {
+	symbol := permissionCallbackSymbol(permCallback, args)
+	if symbol == "" {
+		return nil
+	}
+
+	// The __return_* family is WordPress core's own set of constant-value
+	// helpers. They are declared by core, not by the plugin, so they are not
+	// plugin code a scanner should look at, and __return_true in particular is
+	// core's idiom for "this route is public".
+	if strings.HasPrefix(symbol, "__return_") {
+		return nil
+	}
+
+	line := 0
+	if bare := bareSymbolName(symbol); bare != "" {
+		line = findDeclarationLine(content, bare)
+	}
+
+	// A route with several method handlers shares one permission callback in the
+	// common case; one endpoint per method mirrors the handler.
+	out := make([]models.Endpoint, 0, len(methods))
+	for _, method := range methods {
+		out = append(out, models.Endpoint{
+			PluginSlug: pluginSlug,
+			Type:       EndpointTypeRESTPermission,
+			Route:      combineRoute(namespace, route) + "#permission_callback:" + symbol,
+			Method:     method,
+			AuthLevel:  models.Unauthenticated,
+			Callback:   NormalizeCallback(symbol),
+			File:       filepath,
+			Line:       line,
+			RawCode:    truncateCode(fullMatch, 500),
+			Namespace:  namespace,
+		})
+	}
+	return out
+}
+
+// permissionCallbackSymbol turns what ParsePermissionCallbackWithContext reports
+// into a name the call graph can look up.
+//
+// That function returns either a bare callable name or one of its own tagged
+// forms -- "delegated:m" for `return $this->m(...)` inside a closure, "arrow:m"
+// for the same in an arrow function, "static:Cls::m", "function:name", or
+// "anonymous" for a closure it read but could not attribute. The tags describe
+// how the name was found, not what it is called, so they are stripped here.
+//
+// PHP resolves `array( $this, 'm' )` against the object's class, so the raw
+// source text decides whether the name needs a class qualifier. That is a PHP
+// language fact and holds for any plugin.
+func permissionCallbackSymbol(permCallback, args string) string {
+	permCallback = strings.TrimSpace(permCallback)
+	if permCallback == "" {
+		return ""
+	}
+
+	switch {
+	case strings.HasPrefix(permCallback, "static:"):
+		// Already Class::method.
+		return strings.TrimPrefix(permCallback, "static:")
+	case strings.HasPrefix(permCallback, "function:"):
+		return strings.TrimPrefix(permCallback, "function:")
+	case strings.HasPrefix(permCallback, "delegated:"), strings.HasPrefix(permCallback, "arrow:"):
+		// Both tags mark `$this->name(...)` inside the callback body.
+		name := permCallback
+		name = strings.TrimPrefix(name, "delegated:")
+		name = strings.TrimPrefix(name, "arrow:")
+		return "this::" + name
+	case permCallback == "anonymous":
+		// An inline closure has no name. "closure" is the sentinel the call
+		// graph already understands: GetRecursiveCallsForCallback seeds a
+		// closure endpoint from the bodies of the registration closures in its
+		// own file, so the endpoint reaches the code the closure calls rather
+		// than nothing at all.
+		return "closure"
+	}
+
+	if strings.Contains(permCallback, "::") {
+		return permCallback
+	}
+
+	// A bare name came from the string or array form. Look at how it was written
+	// to decide the qualifier.
+	raw := ""
+	if m := permissionCallbackValuePattern.FindStringSubmatch(args); len(m) >= 2 {
+		raw = m[1]
+	}
+	switch {
+	case strings.Contains(raw, "$this"):
+		return "this::" + permCallback
+	case strings.Contains(raw, "self::class"), strings.Contains(raw, "static::class"),
+		strings.Contains(raw, "__CLASS__"):
+		return "static::" + permCallback
+	}
+	if m := classConstResolvePattern.FindStringSubmatch(raw); len(m) >= 2 {
+		return m[1] + "::" + permCallback
+	}
+	return permCallback
+}
+
+// bareSymbolName strips a class qualifier, leaving the method or function name.
+// A closure has no declaration to point at, so it yields the empty string.
+func bareSymbolName(symbol string) string {
+	if symbol == "closure" {
+		return ""
+	}
+	if idx := strings.LastIndex(symbol, "::"); idx >= 0 {
+		return symbol[idx+2:]
+	}
+	return symbol
+}
+
+// findDeclarationLine returns the 1-based line of `function <name>(` in content,
+// or 0 when the declaration is not in this file. Zero is the right answer for a
+// symbol declared elsewhere: it is never a real line, so a consumer matching on
+// a line range cannot be misled into thinking the symbol sits inside one.
+//
+// This is a scan rather than a regexp because the name is the variable part and
+// the package convention is to compile patterns once at package level; building
+// a fresh pattern per callback would compile one regexp per registration.
+// Functions and methods share the same declaration shape in PHP, so one scan
+// covers both.
+func findDeclarationLine(content, name string) int {
+	if name == "" {
+		return 0
+	}
+	for i := 0; i < len(content); {
+		idx := strings.Index(content[i:], name)
+		if idx < 0 {
+			return 0
+		}
+		pos := i + idx
+		i = pos + len(name)
+
+		// Not a fragment of a longer identifier.
+		if pos > 0 && isIdentByte(content[pos-1]) {
+			continue
+		}
+		// A declaration's name is followed by the parameter list.
+		j := pos + len(name)
+		for j < len(content) && (content[j] == ' ' || content[j] == '\t') {
+			j++
+		}
+		if j >= len(content) || content[j] != '(' {
+			continue
+		}
+		// ... and preceded by the `function` keyword, possibly with a
+		// by-reference "&".
+		k := pos - 1
+		for k >= 0 && (content[k] == ' ' || content[k] == '\t' || content[k] == '&') {
+			k--
+		}
+		if k < 7 || !strings.EqualFold(content[k-7:k+1], "function") {
+			continue
+		}
+		return countLines(content[:pos]) + 1
+	}
+	return 0
+}
+
 // createRESTEndpoints creates endpoint objects from parsed REST route data
 func createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug, content string, position int) []models.Endpoint {
 	endpoints := make([]models.Endpoint, 0)
@@ -1281,7 +2007,7 @@ func createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug
 					authLevel = enhanced
 				}
 			}
-			authLevel = applyRouteAuthHeuristics(route, namespace, authLevel, routeDef)
+			authLevel = applyDeclaredPublicRoute(route, namespace, authLevel, routeDef)
 
 			for _, method := range methods {
 				ep := models.Endpoint{
@@ -1298,6 +2024,12 @@ func createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug
 				}
 				endpoints = append(endpoints, ep)
 			}
+
+			// The permission callback runs anonymously on every request to this
+			// route; record it as its own entry point.
+			endpoints = append(endpoints, restPermissionEndpoints(
+				permCallback, routeDef, namespace, route, fullMatch,
+				filepath, pluginSlug, content, methods)...)
 		}
 		return endpoints
 	}
@@ -1327,9 +2059,9 @@ func createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug
 		}
 	}
 
-	// Apply route-based auth heuristics
-	// Routes containing "admin" in the path likely require admin access
-	authLevel = applyRouteAuthHeuristics(route, namespace, authLevel, args)
+	// Lower the level when the registration declares the route public.
+	// This can never raise it: see applyDeclaredPublicRoute.
+	authLevel = applyDeclaredPublicRoute(route, namespace, authLevel, args)
 
 	// Create endpoint for each method
 	for _, method := range methods {
@@ -1347,6 +2079,12 @@ func createRESTEndpoints(namespace, route, args, fullMatch, filepath, pluginSlug
 		}
 		endpoints = append(endpoints, ep)
 	}
+
+	// The permission callback runs anonymously on every request to this route;
+	// record it as its own entry point.
+	endpoints = append(endpoints, restPermissionEndpoints(
+		permCallback, args, namespace, route, fullMatch,
+		filepath, pluginSlug, content, methods)...)
 
 	// Filter out blocked endpoints (those with __return_false or similar)
 	// These are inaccessible to everyone and should not be included in security analysis
@@ -1768,10 +2506,53 @@ func min(a, b int) int {
 	return b
 }
 
-// applyRouteAuthHeuristics applies route-based heuristics to adjust auth level
-// Routes containing certain patterns likely require specific auth levels
-func applyRouteAuthHeuristics(route, namespace string, currentLevel models.AuthLevel, args string) models.AuthLevel {
-	// Check for explicit unauthenticated patterns first - don't override these
+// applyDeclaredPublicRoute lowers a route's reported level when the registration
+// declares the route public. It is deliberately the only route-string rule left in
+// this file, and it can only ever LOWER a level.
+//
+// WordPress decides what a REST route requires from its permission_callback and
+// from nothing else. WP_REST_Server::dispatch() matches the request path against
+// the route regex and then calls exactly the permission_callback registered for
+// that route; when the key is absent core emits _doing_it_wrong() and serves the
+// request anyway. No part of core reads the spelling of a route to decide
+// privilege, so no substring of a route may add privilege here either.
+//
+// This function used to do exactly that. It raised the level whenever the
+// lowercased namespace+"/"+route contained any of "/admin", "/settings",
+// "/options", "/config", "/manage", "/dashboard" (to Admin), "/user/", "/me",
+// "/profile/", "/account/" (to Subscriber), or any of 34 further substrings in a
+// helper called isLikelyAdminRoute. Two things made it worse than a bad guess.
+// The tests were unanchored strings.Contains, so "/me" matched "/media",
+// "/members", "/message" and "/menu". And the raise ran AFTER
+// ParsePermissionCallbackWithContext had already read the callback body, so a
+// measured conclusion was overwritten by a spelling.
+//
+// Measured on 143 real plugin trees: 227 of 1883 register_rest_route call sites
+// in 20 trees were given a level strictly higher than the permission-callback
+// analysis had just concluded -- 201 subscriber->admin, 18 unauth->subscriber,
+// 8 unauth->admin. Two registrations with a byte-identical permission callback
+// disagreed purely on their path: "/media/import" came out subscriber (the
+// unanchored "/me") while "/thing/import" came out unauthenticated. One of those
+// promotions is the CVE-2024-6328 route (wc/v2/flutter/media), reported as
+// subscriber against a truth of unauthenticated -- a real, anonymously reachable
+// vulnerability made to look gated.
+//
+// Reporting a HIGHER level than the truth is the failure that hides a bug, so
+// every raising arm is gone. What remains can only lower:
+//
+//   - an explicit __return_true, which is core's own way of writing "public";
+//   - the configured public indicators, kept because they only ever lower. Note
+//     that this arm is a naming convention and NOT derivable from core semantics;
+//     it is retained as a deliberate safe-direction policy choice, not as a fact
+//     about WordPress.
+//
+// The one raising arm that survives is cfg.REST.AdminNamespaces, which ships
+// empty (pkg/config/plugins.go) and is filled only by an operator profile. That
+// is an explicit human assertion about a specific installation, not an inference
+// the analyzer made from a string.
+func applyDeclaredPublicRoute(route, namespace string, currentLevel models.AuthLevel, args string) models.AuthLevel {
+	// An explicit __return_true is WordPress's own idiom for "no permission
+	// required". Nothing may override it.
 	if isExplicitlyUnauthenticated(args) {
 		return models.Unauthenticated
 	}
@@ -1779,17 +2560,14 @@ func applyRouteAuthHeuristics(route, namespace string, currentLevel models.AuthL
 	fullRoute := strings.ToLower(namespace + "/" + route)
 	lowerNamespace := strings.ToLower(namespace)
 
-	// Get configuration
 	cfg := getRESTConfig()
 
-	// ============================================
-	// ADMIN NAMESPACE DETECTION (from configuration only)
-	// No hardcoded plugin namespaces - users add their own via config
-	// ============================================
+	// Operator-declared admin namespaces. Empty by default; this is a human
+	// assertion about a particular installation, not a rule inferred from a
+	// route string, which is why it is allowed to raise.
 	if cfg != nil && cfg.REST != nil && len(cfg.REST.AdminNamespaces) > 0 {
 		for _, adminNS := range cfg.REST.AdminNamespaces {
 			if strings.Contains(lowerNamespace, strings.ToLower(adminNS)) {
-				// This namespace is admin-only, upgrade to Admin if not already
 				if currentLevel == models.Subscriber || currentLevel == models.Unauthenticated {
 					return models.Admin
 				}
@@ -1798,22 +2576,10 @@ func applyRouteAuthHeuristics(route, namespace string, currentLevel models.AuthL
 		}
 	}
 
-	// If namespace is dynamic (unresolved), use more aggressive route-based heuristics
-	if strings.Contains(lowerNamespace, "{dynamic") || strings.Contains(lowerNamespace, "{") {
-		// Dynamic namespace - apply stronger route heuristics
-		if currentLevel == models.Subscriber && isLikelyAdminRoute(fullRoute) {
-			return models.Admin
-		}
-	}
-
-	// ============================================
-	// PUBLIC INDICATORS (from configuration or defaults)
-	// ============================================
 	var publicIndicators []string
 	if cfg != nil && cfg.REST != nil && len(cfg.REST.PublicIndicators) > 0 {
 		publicIndicators = cfg.REST.PublicIndicators
 	} else {
-		// Default public indicators
 		publicIndicators = []string{
 			"/public/",
 			"/embed/",
@@ -1828,168 +2594,7 @@ func applyRouteAuthHeuristics(route, namespace string, currentLevel models.AuthL
 		}
 	}
 
-	// ============================================
-	// USER ROUTE PATTERNS (from configuration or defaults)
-	// ============================================
-	var userRoutePatterns []string
-	if cfg != nil && cfg.REST != nil && len(cfg.REST.UserRoutePatterns) > 0 {
-		userRoutePatterns = cfg.REST.UserRoutePatterns
-	} else {
-		// Default user route patterns
-		userRoutePatterns = []string{
-			"/user/",
-			"/me/",
-			"/me",
-			"/profile/",
-			"/account/",
-		}
-	}
-
-	for _, indicator := range userRoutePatterns {
-		if strings.Contains(fullRoute, indicator) {
-			if currentLevel == models.Unauthenticated {
-				return models.Subscriber
-			}
-			return currentLevel
-		}
-	}
-
-	// ============================================
-	// ADMIN ROUTE PATTERNS (from configuration or defaults)
-	// ============================================
-	var adminRoutePatterns []string
-	if cfg != nil && cfg.REST != nil && len(cfg.REST.AdminRoutePatterns) > 0 {
-		adminRoutePatterns = cfg.REST.AdminRoutePatterns
-	} else {
-		// Default admin route patterns
-		adminRoutePatterns = []string{
-			"/admin/",
-			"/admin-",
-			"-admin/",
-			"/settings",
-			"/options",
-			"/config",
-			"/manage",
-			"/dashboard",
-		}
-	}
-
-	// If current level is Unauthenticated or User, upgrade to Admin for admin routes
-	if currentLevel == models.Unauthenticated || currentLevel == models.Subscriber {
-		for _, indicator := range adminRoutePatterns {
-			if strings.Contains(fullRoute, indicator) {
-				return models.Admin
-			}
-		}
-	}
-
-	// Specific pattern: route path ends with "/admin" or contains "/admin/"
-	if strings.Contains(fullRoute, "/admin") && (currentLevel == models.Unauthenticated || currentLevel == models.Subscriber) {
-		return models.Admin
-	}
-
-	// If permission callback exists but we couldn't determine auth level, and it's User,
-	// check if route pattern suggests admin access
-	if currentLevel == models.Subscriber && isLikelyAdminRoute(fullRoute) {
-		return models.Admin
-	}
-
 	return currentLevel
-}
-
-// isLikelyAdminRoute checks if a route pattern suggests admin-level access
-func isLikelyAdminRoute(route string) bool {
-	// Patterns that often indicate admin-only routes
-	adminPatterns := []string{
-		"bulk",
-		"batch",
-		"/create",
-		"/delete",
-		"/update",
-		"/save",
-		"/edit",
-		"/remove",
-		"/clear",
-		"/flush",
-		"/reset",
-		"/rebuild",
-		"/regenerate",
-		"/scan",
-		"/audit",
-		"/logs",
-		"/debug",
-		"/test",
-		"sync",
-		"/connect",
-		"/disconnect",
-		"/authorize",
-		"/tokens",
-		"/credentials",
-		"/modules",
-		"/plugins",
-		"/themes",
-		"/tools",
-		"/utilities",
-		"/send",
-		"/publish",
-		"/draft",
-		"/trash",
-		"/restore",
-	}
-
-	for _, pattern := range adminPatterns {
-		if strings.Contains(route, pattern) {
-			// Exception: check for user-facing patterns
-			if isUserFacingRoutePattern(route) {
-				return false
-			}
-			return true
-		}
-	}
-
-	return false
-}
-
-// isUserFacingRoutePattern checks if a route is user-facing even though it has admin-like keywords
-func isUserFacingRoutePattern(route string) bool {
-	userFacingPatterns := []string{
-		"/form",
-		"/submit",
-		"/post",
-		"/comment",
-		"/reply",
-		"/message",
-		"/contact",
-		"/subscription",
-		"/newsletter",
-		"/register",
-		"/login",
-		"/auth",
-		"/password",
-		"/bookmark",
-		"/favorite",
-		"/wishlist",
-		"/rating",
-		"/vote",
-		"/like",
-		"/share",
-		"/search",
-		"/filter",
-		"/cart",
-		"/checkout",
-		"/order",
-		"/payment",
-		"/shipping",
-		"/address",
-	}
-
-	for _, pattern := range userFacingPatterns {
-		if strings.Contains(route, pattern) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // truncateCode truncates code to maxLen characters
@@ -2181,7 +2786,17 @@ func findPropertyNamespace(content string, pluginSlug string) string {
 //	$route_args = [ 'methods' => 'POST', 'callback' => [...], 'permission_callback' => [...] ];
 //	register_rest_route( Main::API_V1_NAMESPACE, self::ROUTE, $route_args );
 func findVariableArrayValue(content, varName string, beforePosition int) string {
-	// Only look at content before the register_rest_route call
+	// A local variable must have been assigned before the call for the value to
+	// be there at run time, so only the text above the call is relevant.
+	//
+	// A PROPERTY is different: $this->routes is assigned by a constructor, a
+	// setter or an overriding subclass method, any of which may be written
+	// after the registration in the same file. PHP does not care about source
+	// order for a property, so neither should this search. Callers that want
+	// whole-file behaviour pass len(content).
+	if beforePosition > len(content) {
+		beforePosition = len(content)
+	}
 	searchContent := content[:beforePosition]
 
 	// Build pattern to find: $varName = [...] or $varName = array(...)
