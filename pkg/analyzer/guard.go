@@ -445,9 +445,17 @@ func classifyCheck(mask string, decls []FuncDecl, callStart, parenClose int, sco
 
 	kwLoc := lastConditionKeyword(prefix)
 	if kwLoc == nil {
-		// Not a condition: an assignment, or an argument to something else.
-		// Such a check gates nothing by itself; the assign-then-test idiom is
-		// picked up separately.
+		// auth_redirect() is the one check that needs no condition around it:
+		// core's implementation redirects to wp-login.php and exits for a caller
+		// without a valid auth cookie, so calling it as a statement forces a
+		// login on everything after it. Every other check here only returns a
+		// boolean, and a boolean nobody tests gates nothing -- an assignment, or
+		// an argument to something else. The assign-then-test idiom is picked up
+		// separately.
+		if identifierAt(mask, callStart) == "auth_redirect" &&
+			depthAt(mask, callStart) == enclosingBodyDepth(mask, decls, callStart) {
+			return GuardFunction
+		}
 		return GuardNone
 	}
 	kw := strings.ToLower(strings.Join(strings.Fields(prefix[kwLoc[0]:kwLoc[1]]), ""))
@@ -694,6 +702,15 @@ func negationParity(mask string, condOpen, callStart int) int {
 }
 
 // identifierBefore returns the identifier immediately preceding pos, if any.
+// identifierAt returns the identifier starting at pos.
+func identifierAt(s string, pos int) string {
+	i := pos
+	for i < len(s) && isTypeChar(s[i]) {
+		i++
+	}
+	return strings.ToLower(s[pos:i])
+}
+
 func identifierBefore(s string, pos int) string {
 	i := pos
 	for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t') {

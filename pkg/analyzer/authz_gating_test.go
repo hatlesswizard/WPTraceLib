@@ -154,6 +154,15 @@ func TestPresenceOfAnIdentityPredicateIsNotAGate(t *testing.T) {
 		// The bound: the same predicates gate when they gate.
 		{"gating is_user_logged_in", `{ if ( ! is_user_logged_in() ) { wp_send_json_error(); } update_option('o',$_POST['v']); }`, models.Subscriber},
 		{"gating auth_redirect", `{ if ( ! is_user_logged_in() ) { auth_redirect(); exit; } update_option('o',$_POST['v']); }`, models.Subscriber},
+		// auth_redirect() needs no condition: core redirects and exits for a
+		// caller without a valid auth cookie, so calling it forces a login on
+		// everything after it.
+		{"bare auth_redirect", `{ auth_redirect(); update_option('o',$_POST['v']); }`, models.Subscriber},
+		// The bound: only auth_redirect does that. Every other predicate returns
+		// a boolean, and a boolean nobody tests gates nothing.
+		{"bare is_user_logged_in", `{ is_user_logged_in(); update_option('o',$_POST['v']); }`, models.Unauthenticated},
+		{"bare is_super_admin", `{ $x = is_super_admin(); update_option('o',$_POST['v']); }`, models.Unauthenticated},
+		{"auth_redirect nested in a branch", `{ if ( isset($_GET['admin']) ) { auth_redirect(); } update_option('o',$_POST['v']); }`, models.Unauthenticated},
 	})
 }
 
