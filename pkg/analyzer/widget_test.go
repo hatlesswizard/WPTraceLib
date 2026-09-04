@@ -31,11 +31,11 @@ func assertUsableCallbacks(t *testing.T, eps []models.Endpoint) {
 	}
 }
 
-// dynamic_sidebar() calls WP_Widget::widget() on a front-end page, so any
-// visitor reaches it. Naming a method for an index is `Class::method`; the
-// trailing "()" made it a call expression, which every call-graph entry point
-// refuses, so the endpoint reached nothing in any plugin.
-func TestWidgetRenderCallbackIsASymbol(t *testing.T) {
+// WordPress core invokes exactly three methods on a registered widget, each from
+// a different request: widget() from dynamic_sidebar() on a front-end page, and
+// form()/update() from WP_Widget::form_callback()/update_callback() behind
+// edit_theme_options. Each is its own endpoint, named as a symbol.
+func TestWidgetEmitsThreeResolvableEndpoints(t *testing.T) {
 	php := `<?php
 class My_W extends WP_Widget {
 	public function __construct() {
@@ -53,29 +53,27 @@ class My_W extends WP_Widget {
 }
 `
 	eps := DetectWidgets(php, "inc/widget.php", "p")
-	if len(eps) != 2 {
-		t.Fatalf("want 2 endpoints, got %d: %v", len(eps), slashRoutes(eps))
+	if len(eps) != 3 {
+		t.Fatalf("want 3 endpoints, got %d: %v", len(eps), slashRoutes(eps))
 	}
+	assertUsableCallbacks(t, eps)
 
 	render := epByRoute(t, eps, "widget:my_w:render")
-	if render.Callback != "My_W::widget" {
-		t.Errorf("render callback = %q, want My_W::widget", render.Callback)
+	if render.Callback != "My_W::widget" || render.AuthLevel != models.Unauthenticated {
+		t.Errorf("render = %q / %v", render.Callback, render.AuthLevel)
 	}
-	if render.AuthLevel != models.Unauthenticated {
-		t.Errorf("render level = %v, want unauthenticated", render.AuthLevel)
+	form := epByRoute(t, eps, "widget:my_w:form")
+	if form.Callback != "My_W::form" || form.AuthLevel != models.Admin {
+		t.Errorf("form = %q / %v", form.Callback, form.AuthLevel)
+	}
+	update := epByRoute(t, eps, "widget:my_w:update")
+	if update.Callback != "My_W::update" || update.AuthLevel != models.Admin {
+		t.Errorf("update = %q / %v", update.Callback, update.AuthLevel)
 	}
 	for _, ep := range eps {
 		if ep.Line != 2 {
 			t.Errorf("endpoint %q has line %d, want 2", ep.Route, ep.Line)
 		}
-	}
-
-	// The admin side is untouched by this step, on purpose: the two methods it
-	// fuses are Admin-level, and making them resolvable adds reach at a level
-	// that can gate. That lands on its own.
-	admin := epByRoute(t, eps, "widget:my_w:admin")
-	if admin.AuthLevel != models.Admin {
-		t.Errorf("admin level = %v, want admin", admin.AuthLevel)
 	}
 }
 
@@ -109,10 +107,10 @@ class Sig_W extends WP_Widget {
 }
 `
 	eps := DetectWidgets(php, "w.php", "p")
-	if len(eps) != 2 {
-		t.Fatalf("want 2 endpoints, got %d: %v", len(eps), slashRoutes(eps))
+	if len(eps) != 3 {
+		t.Fatalf("want 3 endpoints, got %d: %v", len(eps), slashRoutes(eps))
 	}
-	assertUsableCallbacks(t, []models.Endpoint{epByRoute(t, eps, "widget:sig_w:render")})
+	assertUsableCallbacks(t, eps)
 }
 
 // register_widget() ends in WP_Widget_Factory::register(), which constructs the
@@ -180,6 +178,22 @@ class Not_A_Widget extends Some_Base {
 `
 	if eps := DetectWidgets(php, "w.php", "p"); len(eps) != 0 {
 		t.Fatalf("want no endpoint, got %v", slashRoutes(eps))
+	}
+}
+
+// A class that overrides only one of the three methods gets only that endpoint.
+func TestWidgetPartialOverrides(t *testing.T) {
+	php := `<?php
+class Only_Update extends WP_Widget {
+	public function update( $new, $old ) { return $new; }
+}
+`
+	eps := DetectWidgets(php, "w.php", "p")
+	if len(eps) != 1 {
+		t.Fatalf("want 1 endpoint, got %d: %v", len(eps), slashRoutes(eps))
+	}
+	if eps[0].Route != "widget:only_update:update" || eps[0].Callback != "Only_Update::update" {
+		t.Errorf("endpoint = %q / %q", eps[0].Route, eps[0].Callback)
 	}
 }
 

@@ -80,11 +80,9 @@ var (
 //     /wp/v2/widgets REST route, both behind edit_theme_options.
 //   - update()  -- WP_Widget::update_callback(), same screen, same capability.
 //
-// The render endpoint names its method as a symbol. The admin-side endpoint is
-// left exactly as it was, fusing form() and update() into one unresolvable
-// string, so that this change adds only Unauthenticated reach and nothing at
-// Admin: giving those two methods resolvable names is a separate step with a
-// different risk profile, and it lands separately.
+// form() and update() are separate endpoints rather than one, because they are
+// separate functions reached by separate requests and a call graph can only walk
+// from a name that denotes one of them.
 func DetectWidgets(content, filepath, pluginSlug string) []models.Endpoint {
 	var endpoints []models.Endpoint
 
@@ -143,19 +141,26 @@ func DetectWidgets(content, filepath, pluginSlug string) []models.Endpoint {
 			})
 		}
 
-		// Create admin endpoint if form() or update() method exists
-		if hasFormMethod || hasUpdateMethod {
-			callback := className + "::form()"
-			if hasUpdateMethod {
-				callback = className + "::form()/update()"
-			}
-
+		// The admin-side endpoints. Both are edit_theme_options, which is an
+		// administrator capability on a stock single site.
+		if hasFormMethod {
 			endpoints = append(endpoints, models.Endpoint{
 				PluginSlug: pluginSlug,
 				Type:       models.EndpointTypeWidget,
-				Route:      "widget:" + widgetID + ":admin",
-				AuthLevel:  models.Admin, // Admin forms are always admin-level
-				Callback:   callback,
+				Route:      "widget:" + widgetID + ":form",
+				AuthLevel:  models.Admin,
+				Callback:   className + "::form",
+				File:       filepath,
+				Line:       declLine,
+			})
+		}
+		if hasUpdateMethod {
+			endpoints = append(endpoints, models.Endpoint{
+				PluginSlug: pluginSlug,
+				Type:       models.EndpointTypeWidget,
+				Route:      "widget:" + widgetID + ":update",
+				AuthLevel:  models.Admin,
+				Callback:   className + "::update",
 				File:       filepath,
 				Line:       declLine,
 			})
