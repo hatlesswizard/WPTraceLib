@@ -147,7 +147,10 @@ func wordPressCoreAdminCapabilities() []string {
 		"edit_user",   // Meta cap: editing user profiles
 		"delete_user", // Meta cap: deleting users
 
-		// Role slug: see the note in wordPressCoreEditorCapabilities.
+		// Role slug, not a capability name in the usual sense. WP_User::add_role()
+		// writes $this->caps[$role] = true and WP_User::get_role_caps() merges
+		// $this->caps into $allcaps, so the slug is a live key in allcaps and
+		// current_user_can('administrator') is true for exactly the administrators.
 		"administrator",
 	}
 }
@@ -221,26 +224,6 @@ func wordPressCoreEditorCapabilities() []string {
 		"level_6",
 		"level_7",
 
-		// Role slug. A role slug IS a capability key. WP_User::add_role() writes
-		// $this->caps[ $role ] = true, and WP_User::get_role_caps() merges
-		// $this->caps into $allcaps wholesale, so the slug survives into the array
-		// has_cap() tests. map_meta_cap() has no case for a role name, so its
-		// default branch does $caps[] = $cap and has_cap() then looks up
-		// $capabilities['editor'] directly. current_user_can('editor') is
-		// therefore true for exactly the users holding that role.
-		//
-		// It is an exact assertion rather than a threshold: an administrator does
-		// NOT pass current_user_can('editor'), because an administrator's caps
-		// array holds 'administrator', not 'editor'. Placing the slug at its own
-		// role's level is the closest a ladder can come, and it errs toward
-		// saying an administrator would pass -- the harmless direction.
-		//
-		// Only 'administrator' was recognised before, so current_user_can('editor')
-		// fell through to the Subscriber default. 13 of the 143 measured trees
-		// check a non-administrator role slug this way (editor 13, author 3,
-		// subscriber 1, contributor 0).
-		"editor",
-
 		// Meta capabilities (singular forms) - pages and terms require Editor
 		"edit_page",    // Meta cap: page editing requires Editor level
 		"delete_page",  // Meta cap: page deletion requires Editor level
@@ -274,9 +257,6 @@ func wordPressCoreAuthorCapabilities() []string {
 		// level_2 and no lower role receives it.
 		"level_2",
 
-		// Role slug: see the note in wordPressCoreEditorCapabilities.
-		"author",
-
 		// Meta capabilities (singular forms)
 		"publish_post", // Meta cap: publishing requires Author level
 	}
@@ -294,9 +274,6 @@ func wordPressCoreContributorCapabilities() []string {
 		// Legacy numeric user level: populate_roles_160() gives the contributor
 		// role level_1 and no lower role receives it.
 		"level_1",
-
-		// Role slug: see the note in wordPressCoreEditorCapabilities.
-		"contributor",
 
 		// Meta capabilities (singular forms) - resolved to base level for static analysis
 		// Without runtime context, we map to the least restrictive interpretation
@@ -336,9 +313,6 @@ func wordPressCoreSubscriberCapabilities() []string {
 		// logged-in caller: Subscriber is exact there, and one level high for a
 		// bare current_user_can('exist'), which occurs nowhere in the corpus.
 		"exist",
-
-		// Role slug: see the note in wordPressCoreEditorCapabilities.
-		"subscriber",
 
 		// Meta capabilities (singular forms) - reading is subscriber level
 		"read_post", // Meta cap: reading posts requires basic login

@@ -183,31 +183,36 @@ function custom_gated() {
 }
 
 // TestRoleSlugAsCapability pins that a role slug passed to current_user_can()
-// resolves to that role's level on this path too, now that both paths read one
-// table. WP_User::add_role() writes $this->caps[ $role ] = true and
-// get_role_caps() merges $this->caps into $allcaps, so the slug is a live
-// capability key and current_user_can('editor') is true for exactly the editors.
+// resolves through the shared table on this path too.
+//
+// Only 'administrator' is in the table. A role slug IS a capability key --
+// WP_User::add_role() writes $this->caps[ $role ] = true and get_role_caps()
+// merges $this->caps into $allcaps -- so 'editor', 'author', 'contributor' and
+// 'subscriber' belong there on the same reasoning. They were added and then
+// reverted: with them resolvable, min-over-gating-capabilities loses the
+// Subscriber floor it gets from an unresolvable name, and a gate of the shape
+//
+//     if ( $owner_id != $user->ID && ! current_user_can('administrator')
+//                                 && ! current_user_can('editor') ) { wp_die(); }
+//
+// reads as an editor gate although the owner -- any logged-in user -- passes it.
+// The missing piece is in pkg/analyzer's guard classifier, which cannot see that
+// a disjunct which is not a capability check also lets a caller in. Once it can,
+// the four slugs go back.
 func TestRoleSlugAsCapability(t *testing.T) {
-	for slug, want := range map[string]models.AuthLevel{
-		"editor":        models.Editor,
-		"author":        models.Author,
-		"contributor":   models.Contributor,
-		"administrator": models.Admin,
-	} {
-		r, _ := buildTestResolver(t, `<?php
+	r, _ := buildTestResolver(t, `<?php
 function role_gated() {
-    if ( ! current_user_can('`+slug+`') ) { wp_die(); }
+    if ( ! current_user_can('administrator') ) { wp_die(); }
     $v = $_POST['value'];
 }
 `)
-		hasGuard, level := r.HasAuthGuardBeforeInput("role_gated")
-		if !hasGuard {
-			t.Errorf("%s: should report a guard", slug)
-			continue
-		}
-		if level != want {
-			t.Errorf("%s: got %s, want %s", slug, level, want)
-		}
+
+	hasGuard, level := r.HasAuthGuardBeforeInput("role_gated")
+	if !hasGuard {
+		t.Fatal("role_gated should report a guard")
+	}
+	if level != models.Admin {
+		t.Errorf("administrator: got %s, want admin", level)
 	}
 }
 
