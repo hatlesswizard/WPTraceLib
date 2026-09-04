@@ -516,10 +516,160 @@ var wcAPICallbackConcatPattern = regexp.MustCompile(
 		`([^,)]+)`,
 )
 
+// hookIsAnonymousDispatch reports whether WordPress core itself runs a handler
+// registered on this hook for a request that carries no authentication cookie.
+//
+// Three hook families qualify, and each is a core routing decision taken before
+// any plugin code runs:
+//
+//   - wp-admin/admin-ajax.php: if ( is_user_logged_in() ) do_action( 'wp_ajax_' . $action );
+//     else do_action( 'wp_ajax_nopriv_' . $action );
+//   - wp-admin/admin-post.php makes the same split between admin_post_ and
+//     admin_post_nopriv_.
+//   - heartbeat_nopriv_received and heartbeat_nopriv_send are fired by core's own
+//     wp_ajax_nopriv_heartbeat handler, i.e. from the anonymous arm above.
+//
+// A plugin that writes add_action('wp_ajax_nopriv_X', $cb) has therefore, by
+// core routing, made $cb reachable by an anonymous HTTP request, and no property
+// of $cb's body can change which hook core fires. What a body check can
+// establish is that the handler returns early for some callers; that is a
+// property of the handler, not of reachability, and reporting it as privilege
+// makes an attacker-reachable vulnerability look gated.
+//
+// admin_action_nopriv_ is deliberately absent. WordPress defines no such hook:
+// wp-admin/admin.php fires admin_action_{$action} after auth_redirect() and
+// there is no anonymous counterpart anywhere in core, so a registration on that
+// name is a hook nothing ever fires rather than a dispatch fact (measured: zero
+// occurrences across the 143 plugin trees). The third-party dispatchers
+// (wc_ajax_, woocommerce_api_, acf_ajax:, elementor_ajax:) are absent for the
+// same reason: what they route is decided by a plugin, not by core, so the
+// levels this file gives them stay inferences and remain liftable.
+func hookIsAnonymousDispatch(hook string) bool {
+	return strings.HasPrefix(hook, "wp_ajax_nopriv_") ||
+		strings.HasPrefix(hook, "admin_post_nopriv_") ||
+		strings.HasPrefix(hook, "heartbeat_nopriv_")
+}
+
+// ajaxEndpointList accumulates the endpoints DetectAJAXEndpoints emits together
+// with the hook family each registration used.
+//
+// Carrying the hook alongside the endpoint is what lets the dispatch fact above
+// be a floor rather than a starting guess. It used to be a default that the very
+// next statement could overwrite -- parseAJAXMatch set Unauthenticated for a
+// nopriv registration and then raised it again from the callback body -- and
+// because the one repair step that took a minimum across the priv/nopriv twin
+// identified the anonymous half by its LEVEL, a single raised endpoint also
+// stopped its twin from being downgraded. Keeping the registration itself means
+// neither of those can happen again.
+type ajaxEndpointList struct {
+	eps   []models.Endpoint
+	hooks []string
+}
+
+// add records an endpoint together with the hook family it was registered on.
+func (l *ajaxEndpointList) add(ep models.Endpoint, hook string) {
+	l.eps = append(l.eps, ep)
+	l.hooks = append(l.hooks, hook)
+}
+
+// correlateTwins downgrades a privileged registration whose action is ALSO
+// registered on the anonymous half of the same core dispatcher. formatAjaxRoute
+// maps both halves onto one URL, which is what makes the two comparable.
+//
+// The downgrade is a claim about a CALLBACK, not about an action name: core
+// routes the anonymous request to whatever the nopriv registration bound, and
+// that need not be what the privileged one bound. A plugin can point the nopriv
+// half at a stub that only says "log in first" while the privileged half does
+// the real work: measured over the 143-tree corpus, 29 actions in 10 trees bind
+// provably different handlers on the two halves. So the twin is followed only
+// when the two registrations cannot be shown to bind different handlers.
+func (l *ajaxEndpointList) correlateTwins() {
+	anonHandlers := make(map[string][]string)
+	for i := range l.eps {
+		if hookIsAnonymousDispatch(l.hooks[i]) {
+			anonHandlers[l.eps[i].Route] = append(anonHandlers[l.eps[i].Route], l.eps[i].Callback)
+		}
+	}
+	if len(anonHandlers) == 0 {
+		return
+	}
+
+	for i := range l.eps {
+		if l.eps[i].AuthLevel == models.Unauthenticated || hookIsAnonymousDispatch(l.hooks[i]) {
+			continue
+		}
+		for _, anonCallback := range anonHandlers[l.eps[i].Route] {
+			if handlersProvablyDiffer(l.eps[i].Callback, anonCallback) {
+				continue
+			}
+			l.eps[i].AuthLevel = models.Unauthenticated
+			l.eps[i].RawCode += " [downgraded: has nopriv variant]"
+			break
+		}
+	}
+}
+
+// enforceAnonymousDispatchFloor clamps every endpoint whose registration core
+// routes to anonymous callers back down to Unauthenticated.
+//
+// After the callback-body raise was removed from parseAJAXMatch nothing in this
+// file raises such an endpoint any more, so this pass is normally a no-op. It
+// exists so that the invariant is checked in one place rather than depended on
+// at thirty emission sites.
+func (l *ajaxEndpointList) enforceAnonymousDispatchFloor() {
+	for i := range l.eps {
+		if hookIsAnonymousDispatch(l.hooks[i]) && l.eps[i].AuthLevel > models.Unauthenticated {
+			l.eps[i].AuthLevel = models.Unauthenticated
+			l.eps[i].RawCode += " [floor: core dispatches " + l.hooks[i] + " to anonymous callers]"
+		}
+	}
+}
+
+// handlersProvablyDiffer reports whether two callback strings are known to name
+// different handlers.
+//
+// It answers "no" whenever the answer is not certain. An unresolved expression
+// or a sentinel such as "unknown" names nothing that can be compared, and
+// treating those as different would re-introduce exactly the over-restriction
+// the twin correlation exists to remove. Only the method tail is compared:
+// two detectors can spell one method as "handle" and as "this::handle", and PHP
+// method names are case-insensitive.
+func handlersProvablyDiffer(a, b string) bool {
+	nameA, okA := comparableHandlerName(a)
+	nameB, okB := comparableHandlerName(b)
+	if !okA || !okB {
+		return false
+	}
+	return nameA != nameB
+}
+
+// comparableHandlerName reduces a callback to the handler name that can be
+// compared with another, reporting false when there is no such name.
+func comparableHandlerName(callback string) (string, bool) {
+	callback = strings.TrimSpace(callback)
+	if idx := strings.LastIndex(callback, "::"); idx >= 0 {
+		callback = callback[idx+2:]
+	}
+	callback = strings.ToLower(strings.TrimSpace(callback))
+	if callback == "" {
+		return "", false
+	}
+	switch callback {
+	case "unknown", "inline", "closure", "anonymous", "anonymous_function",
+		"loader_callback", "array_callback", "callback":
+		return "", false
+	}
+	// Anything still carrying PHP syntax is an expression, not a name.
+	if strings.ContainsAny(callback, "${}()[]'\", \t.") {
+		return "", false
+	}
+	return callback, true
+}
+
 // DetectAJAXEndpoints finds all AJAX endpoints in PHP code
 func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.Endpoint {
 	// Pre-allocate with estimated capacity to reduce slice growth allocations
-	endpoints := make([]models.Endpoint, 0, 16)
+	out := ajaxEndpointList{}
 	processedPositions := make(map[int]bool)
 
 	// 1. Find authenticated AJAX endpoints (wp_ajax_*) - literal strings
@@ -537,7 +687,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		processedPositions[match[0]] = true
 		ep := parseAJAXMatch(content, match, filepath, pluginSlug, false)
 		if ep != nil {
-			endpoints = append(endpoints, *ep)
+			out.add(*ep, "wp_ajax_")
 		}
 	}
 
@@ -547,7 +697,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		processedPositions[match[0]] = true
 		ep := parseAJAXMatch(content, match, filepath, pluginSlug, true)
 		if ep != nil {
-			endpoints = append(endpoints, *ep)
+			out.add(*ep, "wp_ajax_nopriv_")
 		}
 	}
 
@@ -590,12 +740,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    rawCode,
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 4. Find concatenated nopriv AJAX: add_action('wp_ajax_nopriv_' . $var, ...)
@@ -624,12 +774,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_nopriv_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    rawCode,
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 5. Find interpolated auth AJAX: add_action("wp_ajax_{$var}", ...)
@@ -658,12 +808,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 6. Find interpolated nopriv AJAX (curly brace syntax)
@@ -687,12 +837,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_nopriv_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 6b. Find simple interpolated auth AJAX: add_action("wp_ajax_$action", ...)
@@ -721,12 +871,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 6c. Find simple interpolated nopriv AJAX: add_action("wp_ajax_nopriv_$action", ...)
@@ -750,12 +900,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_nopriv_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 7. Find $this->action patterns
@@ -789,12 +939,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    rawCode,
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 8. Find $this->action nopriv patterns
@@ -823,12 +973,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_nopriv_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    rawCode,
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 9. Find anonymous function AJAX handlers (wp_ajax_*)
@@ -895,7 +1045,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Line:       lineNum,
 			RawCode:    truncateCode(rawCode, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 10. Find anonymous function AJAX handlers (wp_ajax_nopriv_*)
@@ -927,7 +1077,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Line:       lineNum,
 			RawCode:    truncateCode(rawCode, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 11. Find admin_post_* handlers (form submission hooks - requires login)
@@ -936,10 +1086,20 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		if len(match) < 10 || processedPositions[match[0]] {
 			continue
 		}
-		processedPositions[match[0]] = true
 
 		fullMatch := content[match[0]:match[1]]
 		action := content[match[2]:match[3]]
+
+		// admin_post_ is a prefix of admin_post_nopriv_, so this pattern also
+		// matches the anonymous half of the pair. Leave those to detector 12 --
+		// and leave the position unclaimed, because both patterns anchor on the
+		// same `add_action`, so marking it here is what stopped detector 12 from
+		// ever running. Measured: all 13 admin_post_nopriv_ registrations in the
+		// corpus were being emitted above unauthenticated, 8 of them at admin.
+		if strings.HasPrefix(action, "nopriv_") {
+			continue
+		}
+		processedPositions[match[0]] = true
 
 		// Extract callback
 		var callback string
@@ -955,16 +1115,29 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 
 		lineNum := countLines(content[:match[0]]) + 1
 
-		// admin_post_ requires login, typically admin-level since it's for admin forms
-		authLevel := models.Admin
+		// wp-admin/admin-post.php validates the auth cookie and fires
+		// admin_post_{$action} in the logged-in arm. It never calls
+		// current_user_can(), so the privilege this hook establishes is "any
+		// logged-in user" -- a Subscriber -- and nothing about the hook name
+		// implies a capability. Defaulting to Admin made this the largest single
+		// over-restriction in the corpus: 63 of the 85 literal admin_post_ /
+		// admin_action_ registrations across 143 trees were reported at admin.
+		authLevel := models.Subscriber
 
-		// Look for additional auth checks in callback
+		// The callback body can only RAISE from here, and only as far as Admin:
+		// admin-post.php is a single-site dispatcher, so nothing about it can
+		// imply network scope, and a capability that InferAuthLevel maps to
+		// SuperAdmin (upload_plugins and upload_themes among them, which are
+		// ordinary administrator capabilities on single-site WordPress) must not
+		// push the endpoint past the level it reports today.
 		callbackBody := findCallbackBody(content, callback)
 		if callbackBody != "" {
 			inferredLevel := InferAuthLevel(callbackBody)
-			if inferredLevel == models.Subscriber {
-				// Downgrade to User if callback doesn't have admin capability checks
-				authLevel = models.Subscriber
+			if inferredLevel > authLevel {
+				authLevel = inferredLevel
+			}
+			if authLevel > models.Admin {
+				authLevel = models.Admin
 			}
 		}
 
@@ -974,12 +1147,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("admin_post_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "admin_post_")
 	}
 
 	// 12. Find admin_post_nopriv_* handlers (form submission hooks - no login required)
@@ -1013,12 +1186,16 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("admin_post_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // nopriv means no login required
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		// The route is built with the privileged prefix because formatAjaxRoute
+		// collapses both halves onto one URL, but the HOOK this endpoint came
+		// from is the anonymous one, and that is what the dispatch floor and the
+		// twin correlation must see.
+		out.add(ep, "admin_post_nopriv_")
 	}
 
 	// 13. Find WooCommerce wc_ajax_* handlers
@@ -1083,12 +1260,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wc_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wc_ajax_")
 	}
 
 	// 13b. Find WooCommerce API callback handlers (woocommerce_api_*)
@@ -1126,12 +1303,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("woocommerce_api_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // External webhooks don't use WP auth
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "woocommerce_api_")
 	}
 
 	// 13c. Find WooCommerce API callback handlers with concatenation
@@ -1157,12 +1334,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("woocommerce_api_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // External webhooks don't use WP auth
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "woocommerce_api_")
 	}
 
 	// 14. Find admin_action_* handlers (WordPress admin action hooks)
@@ -1173,15 +1350,18 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 		if len(match) < 10 || processedPositions[match[0]] {
 			continue
 		}
-		processedPositions[match[0]] = true
 
 		fullMatch := content[match[0]:match[1]]
 		action := content[match[2]:match[3]]
 
-		// Skip if this is a nopriv variant (handled separately)
+		// Skip if this is a nopriv variant (handled separately). The position is
+		// left unclaimed for the same reason as in detector 11: both patterns
+		// anchor on the same `add_action`, so claiming it here would block the
+		// detector that is supposed to take over.
 		if strings.HasPrefix(action, "nopriv_") {
 			continue
 		}
+		processedPositions[match[0]] = true
 
 		// Skip invalid action names (e.g., WordPress bulk action indicators)
 		if action == "-1" || action == "" {
@@ -1202,16 +1382,21 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 
 		lineNum := countLines(content[:match[0]]) + 1
 
-		// admin_action_ requires login and is typically admin-level
-		authLevel := models.Admin
+		// wp-admin/admin.php fires admin_action_{$action} after auth_redirect().
+		// The only current_user_can() in that file governs a memory-limit bump,
+		// so like admin_post_ the hook establishes "any logged-in user" and no
+		// more. Raise-only from the callback body, capped at Admin, for the same
+		// reason as detector 11.
+		authLevel := models.Subscriber
 
-		// Look for additional auth checks in callback
 		callbackBody := findCallbackBody(content, callback)
 		if callbackBody != "" {
 			inferredLevel := InferAuthLevel(callbackBody)
-			if inferredLevel == models.Subscriber {
-				// Downgrade to User if callback doesn't have admin capability checks
-				authLevel = models.Subscriber
+			if inferredLevel > authLevel {
+				authLevel = inferredLevel
+			}
+			if authLevel > models.Admin {
+				authLevel = models.Admin
 			}
 		}
 
@@ -1221,12 +1406,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("admin_action_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "admin_action_")
 	}
 
 	// 15. Find admin_action_nopriv_* handlers (no login required)
@@ -1260,12 +1445,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("admin_action_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // nopriv means no login required
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "admin_action_")
 	}
 
 	// 16. Find admin_action_ with dynamic/concatenated action name
@@ -1289,13 +1474,17 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Type:       models.EndpointTypeAJAX,
 			Route:      formatAjaxRoute("admin_action_" + action),
 			Method:     "POST",
-			AuthLevel:  models.Admin, // admin context requires login
-			Callback:   NormalizeCallback(callback),
-			File:       filepath,
-			Line:       lineNum,
-			RawCode:    truncateCode(fullMatch, 500),
+			// wp-admin/admin.php gates admin_action_ on auth_redirect() alone,
+			// so the WordPress-derived level is Subscriber. This block has no
+			// downgrade path at all, which is why the Admin default here was
+			// unconditional.
+			AuthLevel: models.Subscriber,
+			Callback:  normalizeCallbackExpr(callback, content, match[0]),
+			File:      filepath,
+			Line:      lineNum,
+			RawCode:   truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "admin_action_")
 	}
 
 	// 17. Find Heartbeat API handlers (heartbeat_received - requires login by default)
@@ -1328,12 +1517,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("heartbeat_received"),
 			Method:     "POST",
 			AuthLevel:  models.Subscriber, // Heartbeat requires login by default
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "heartbeat_received")
 	}
 
 	// 18. Find Heartbeat API nopriv handlers (no login required)
@@ -1366,12 +1555,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("heartbeat_nopriv_received"),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // nopriv means no login required
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "heartbeat_nopriv_received")
 	}
 
 	// 19. Find Heartbeat send handlers
@@ -1404,12 +1593,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("heartbeat_send"),
 			Method:     "POST",
 			AuthLevel:  models.Subscriber, // Heartbeat requires login by default
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "heartbeat_send")
 	}
 
 	// 20. Find Heartbeat nopriv send handlers
@@ -1442,12 +1631,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("heartbeat_nopriv_send"),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // nopriv means no login required
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "heartbeat_nopriv_send")
 	}
 
 	// 21. Find WordPress Plugin Boilerplate loader auth patterns
@@ -1482,12 +1671,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 22. Find WordPress Plugin Boilerplate loader nopriv patterns
@@ -1510,12 +1699,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_nopriv_" + action),
 			Method:     "POST",
 			AuthLevel:  models.Unauthenticated, // nopriv means no login required
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 23. Find WordPress Plugin Boilerplate loader with concatenated auth patterns
@@ -1551,7 +1740,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_")
 	}
 
 	// 24. Find WordPress Plugin Boilerplate loader with concatenated nopriv patterns
@@ -1580,7 +1769,7 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_nopriv_")
 	}
 
 	// 25. Find framework wrapper patterns: $app->addAction('wp_ajax_[nopriv_]ACTION', ...)
@@ -1632,12 +1821,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute(routePrefix + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, routePrefix)
 	}
 
 	// 26. Find Elementor AJAX framework patterns
@@ -1680,12 +1869,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("elementor_ajax:" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "elementor_ajax:")
 	}
 
 	// 27. Find ACF (Advanced Custom Fields) AJAX registration patterns
@@ -1723,12 +1912,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("acf_ajax:" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "acf_ajax:")
 	}
 
 	// 28. Find Freemius SDK AJAX wrapper patterns
@@ -1770,12 +1959,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute("wp_ajax_fs_" + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, "wp_ajax_fs_")
 	}
 
 	// 29. Find static method wrapper patterns (e.g., Hooks::addAction)
@@ -1817,12 +2006,12 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Route:      formatAjaxRoute(routePrefix + action),
 			Method:     "POST",
 			AuthLevel:  authLevel,
-			Callback:   NormalizeCallback(callback),
+			Callback:   normalizeCallbackExpr(callback, content, match[0]),
 			File:       filepath,
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, routePrefix)
 	}
 
 	// 30. Find generic AJAX wrapper patterns (e.g., $this->endpoints->registerAjaxEndpoint)
@@ -1875,13 +2064,24 @@ func DetectAJAXEndpoints(content, filepath string, pluginSlug string) []models.E
 			Line:       lineNum,
 			RawCode:    truncateCode(fullMatch, 500),
 		}
-		endpoints = append(endpoints, ep)
+		out.add(ep, routePrefix)
 	}
 
-	// Correlate endpoints - some actions have both wp_ajax_ and wp_ajax_nopriv_
-	endpoints = correlateAJAXEndpoints(endpoints)
+	// 31. Registrations whose hook name or callback is written in a shape none of
+	// the patterns above spells out. This is evaluation rather than matching, and
+	// it only looks at call sites the patterns left unclaimed.
+	detectEvaluatedHookRegistrations(content, filepath, pluginSlug, processedPositions, &out)
 
-	return endpoints
+	// An action registered under both wp_ajax_ and wp_ajax_nopriv_ is reachable
+	// anonymously, so the privileged twin describes no privilege either.
+	out.correlateTwins()
+
+	// The dispatch fact is enforced last, and in one place, so that it is a floor
+	// rather than a starting guess: no inference added to this file later can
+	// quietly raise an endpoint that WordPress core routes to anonymous callers.
+	out.enforceAnonymousDispatchFloor()
+
+	return out.eps
 }
 
 // resolveDynamicAction attempts to resolve a dynamic action variable to a literal value
@@ -1957,23 +2157,44 @@ func parseAJAXMatch(content string, match []int, filepath, pluginSlug string, is
 		callback = "unknown"
 	}
 
+	// The array-with-method alternative of the hook patterns captures only the
+	// first quoted fragment, so array( $this, 'ajax_' . 'X' ) arrives here as
+	// "ajax_". Re-reading the argument list with a balanced scan recovers the
+	// whole callable; the regex result is kept whenever that cannot name one.
+	callbackName := normalizeCallbackExpr(callback, content, match[0])
+	if open := strings.IndexByte(content[match[0]:], '('); open >= 0 {
+		if args, _, ok := phpArgList(content, match[0]+open); ok && len(args) >= 2 {
+			scope := enclosingFunctionScope(content, match[0])
+			if better := parsePHPCallable(args, nil, content, scope); better != "unknown" {
+				callbackName = better
+			}
+		}
+	}
+
 	// Calculate line number
 	lineNum := countLines(content[:match[0]]) + 1
 
 	// Determine auth level
 	authLevel := models.Subscriber // Default for wp_ajax_ (requires login)
 	if isNopriv {
-		// wp_ajax_nopriv_* means the endpoint is registered for unauthenticated access.
-		// However, the callback function itself may contain auth checks like
-		// current_user_can(), is_user_logged_in(), wp_verify_nonce(), etc.
-		// Check the callback body for auth patterns (W7 fix).
+		// wp-admin/admin-ajax.php fires wp_ajax_nopriv_{$action} for every request
+		// that does not carry a valid auth cookie, and it decides that before any
+		// plugin code runs. The registration is therefore an upper bound on the
+		// privilege a caller needs, established by core routing.
+		//
+		// This used to read the callback body back and raise the level when it
+		// found something -- and what it mostly found was a nonce, which is CSRF
+		// protection a logged-out visitor can satisfy, because wp_create_nonce()
+		// for user 0 is printed into the public page. That raise did double
+		// damage: it also hid the endpoint from correlateTwins, which recognised
+		// the anonymous half by its level, so one bad guess over-restricted two
+		// endpoints. Measured across 143 plugin trees, 48 nopriv registrations in
+		// 23 trees were reported above unauthenticated this way.
+		//
+		// An internal gate is still worth knowing about, but it belongs in the
+		// guard analysis, and until that is dominance-aware the endpoint level
+		// must reflect the registration rather than the body.
 		authLevel = models.Unauthenticated
-
-		// Check callback body for internal auth checks
-		enhancedAuth := InferAuthLevelFromCallback(callback, content, nil)
-		if enhancedAuth > models.Unauthenticated {
-			authLevel = enhancedAuth
-		}
 	}
 
 	// Look for additional auth checks in the callback function if we can find it
@@ -1994,9 +2215,6 @@ func parseAJAXMatch(content string, match []int, filepath, pluginSlug string, is
 			// Strong indicators in action name
 			if isAdminIndicatorAction(action) {
 				authLevel = models.Admin
-			} else if isAdminIndicatorAction(action) {
-				// Use aggressive heuristics as fallback
-				authLevel = models.Admin
 			}
 		}
 	}
@@ -2013,7 +2231,7 @@ func parseAJAXMatch(content string, match []int, filepath, pluginSlug string, is
 		Route:      formatAjaxRoute(route + action),
 		Method:     "POST", // AJAX typically uses POST
 		AuthLevel:  authLevel,
-		Callback:   NormalizeCallback(callback),
+		Callback:   callbackName,
 		File:       filepath,
 		Line:       lineNum,
 		RawCode:    truncateCode(fullMatch, 500),
@@ -2166,42 +2384,6 @@ func extractStaticCallback(callbackRaw string) string {
 	return strings.Trim(callbackRaw, "'\"")
 }
 
-// correlateAJAXEndpoints marks endpoints that have both auth and nopriv versions
-func correlateAJAXEndpoints(endpoints []models.Endpoint) []models.Endpoint {
-	// Build map of nopriv actions (extract just the action name)
-	// Route format: "wp_ajax_nopriv_ACTION" -> extract "ACTION"
-	noprivActions := make(map[string]bool)
-	for _, ep := range endpoints {
-		if ep.AuthLevel == models.Unauthenticated {
-			// Extract action name from route (strip wp_ajax_nopriv_ or wp_ajax_)
-			action := ep.Route
-			action = strings.TrimPrefix(action, "wp_ajax_nopriv_")
-			action = strings.TrimPrefix(action, "wp_ajax_")
-			if action != "" {
-				noprivActions[action] = true
-			}
-		}
-	}
-
-	// Downgrade auth endpoints that also have nopriv versions to Unauthenticated
-	// If an action has both wp_ajax_ and wp_ajax_nopriv_, it means anyone can access it
-	// So the effective auth level is Unauthenticated
-	for i := range endpoints {
-		if endpoints[i].AuthLevel == models.Subscriber || endpoints[i].AuthLevel == models.Admin {
-			// Extract action name from auth route (strip wp_ajax_)
-			action := strings.TrimPrefix(endpoints[i].Route, "wp_ajax_")
-			if noprivActions[action] {
-				// This action is accessible without auth via nopriv variant
-				// Downgrade to Unauthenticated
-				endpoints[i].AuthLevel = models.Unauthenticated
-				endpoints[i].RawCode += " [downgraded: has nopriv variant]"
-			}
-		}
-	}
-
-	return endpoints
-}
-
 // isAdminIndicatorAction checks if an AJAX action name indicates admin-level functionality
 // Based on common naming conventions in WordPress plugins
 func isAdminIndicatorAction(action string) bool {
@@ -2215,8 +2397,17 @@ func isAdminIndicatorAction(action string) bool {
 	// WORDPRESS CORE PATTERNS (always active)
 	// Strong admin indicators - prefixes that almost always mean admin
 	// ============================================
+	// These quote capability names: manage_options is the capability core itself
+	// gates the Settings API on, and manage_ heads a family of real capabilities
+	// (manage_categories, manage_links, manage_network...).
+	//
+	// The bare "admin_" prefix that used to head this list is gone. It quotes
+	// nothing: an action named admin_something is a plugin's naming convention
+	// for its own admin-side handlers, and WordPress does not read hook names for
+	// privilege. Its measured effect on the 143-tree corpus was zero endpoints
+	// either way, so this is a correction to the rule rather than to a number --
+	// but the rule is what generalises to the plugins the corpus does not contain.
 	coreAdminPrefixes := []string{
-		"admin_",
 		"manage_options",
 		"manage_",
 	}
@@ -2265,163 +2456,24 @@ func isAdminIndicatorAction(action string) bool {
 		}
 	}
 
-	// ============================================
-	// ADDITIONAL ADMIN KEYWORDS (with user-facing exceptions)
-	// ============================================
-	additionalKeywords := []string{
-		"_search", "_list", "_log", "_query", "_panel",
-		"_page", "_view", "_insight", "_statistic", "_report",
-		"_check", "_hide", "_enable", "_disable", "_toggle",
-	}
-
-	for _, keyword := range additionalKeywords {
-		if strings.Contains(normalizedAction, keyword) {
-			// Exception for user-facing patterns
-			if !isUserFacingException(normalizedAction) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// isLikelyAdminAction is a more aggressive heuristic for likely admin actions
-// Used as a fallback when other methods don't detect admin requirements
-func isLikelyAdminAction(action string) bool {
-	action = strings.ToLower(action)
-	normalized := strings.ReplaceAll(action, "-", "_")
-
-	// Common patterns that indicate admin functionality
-	likelyAdminPatterns := []string{
-		// Settings and configuration
-		"save_",
-		"_save",
-		"update_",
-		"_update",
-		"edit_",
-		"_edit",
-		"delete_",
-		"_delete",
-		"remove_",
-		"_remove",
-		"create_",
-		"_create",
-		"new_",
-		"_new",
-		"add_",
-
-		// Plugin lifecycle
-		"install_",
-		"_install",
-		"uninstall",
-		"activate",
-		"deactivate",
-		"upgrade",
-		"downgrade",
-		"migrate",
-		"reset_",
-		"_reset",
-		"clear_",
-		"_clear",
-		"purge_",
-		"_purge",
-		"flush_",
-		"_flush",
-
-		// Admin actions
-		"dismiss",
-		"notice",
-		"review",
-		"feedback",
-		"survey",
-		"promo",
-		"banner",
-		"notification",
-		"widget",
-		"metabox",
-		"dashboard",
-		"screen_options",
-
-		// Configuration
-		"config",
-		"setting",
-		"option",
-		"preference",
-		"setup",
-		"wizard",
-		"onboard",
-
-		// Data management
-		"import",
-		"export",
-		"backup",
-		"restore",
-		"sync",
-		"generate",
-		"regenerate",
-		"build",
-		"rebuild",
-		"scan",
-		"audit",
-		"log",
-		"debug",
-
-		// Plugin operations
-		"license",
-		"api_key",
-		"apikey",
-		"token",
-		"connect",
-		"disconnect",
-		"authorize",
-		"authenticate",
-	}
-
-	for _, pattern := range likelyAdminPatterns {
-		if strings.Contains(normalized, pattern) {
-			// Exception: some patterns are also used in user-facing features
-			if isUserFacingException(normalized) {
-				return false
-			}
-			return true
-		}
-	}
-
-	return false
-}
-
-// isUserFacingException returns true if the action name indicates a user-facing feature
-func isUserFacingException(action string) bool {
-	// Get configuration
-	cfg := getAJAXConfig()
-
-	var userFacingPatterns []string
-	if cfg != nil && cfg.AJAX != nil && len(cfg.AJAX.UserFacingExceptions) > 0 {
-		userFacingPatterns = cfg.AJAX.UserFacingExceptions
-	} else {
-		// Default patterns (backwards compatibility)
-		userFacingPatterns = []string{
-			"form", "submit", "entry",
-			"cart", "checkout", "order", "product", "shop", "store", "payment", "shipping",
-			"profile", "account", "comment", "reply", "message", "contact", "post",
-			"subscribe", "newsletter",
-			"register", "login", "password",
-			"bookmark", "favorite", "wishlist", "follow",
-			"rating", "vote", "like", "share",
-			"search", "filter", "sort", "load_more", "loadmore",
-			"quick_view", "quickview", "preview",
-			"popup", "modal", "slider",
-			"booking", "appointment", "reservation", "calendar", "event",
-		}
-	}
-
-	for _, pattern := range userFacingPatterns {
-		if strings.Contains(action, pattern) {
-			return true
-		}
-	}
-
+	// There used to be a third tier here: _search, _list, _log, _query, _panel,
+	// _page, _view, _insight, _statistic, _report, _check, _hide, _enable,
+	// _disable, _toggle -- any of which promoted the endpoint to Admin unless an
+	// equally English "user-facing exception" list vetoed it.
+	//
+	// It is gone because none of those words is a capability. WordPress grants
+	// privilege through capabilities checked at runtime; do_action( 'wp_ajax_' .
+	// $action ) does not inspect $action for the substring "_view". This is the
+	// same argument the file already accepted when it stopped consulting
+	// isLikelyAdminAction, applied consistently: the surviving tiers quote
+	// capability names (manage_options, manage_) or Settings-API operations that
+	// core itself gates on manage_options.
+	//
+	// Measured over 143 plugin trees: 115 AJAX endpoints in 39 trees were
+	// reported at Admin from files containing no capability check of any kind,
+	// and this tier was the largest single source of them. Among its victims
+	// were a front-end member dashboard tab (via _list), a quick-view popup (via
+	// _view) and every action name a plugin happened to spell with _log.
 	return false
 }
 
@@ -2510,6 +2562,12 @@ func DetectDirectAJAXHandlers(content, filepath string, pluginSlug string) []mod
 func DetectForeachLoopAJAXHandlers(content, filepath string, pluginSlug string) []models.Endpoint {
 	endpoints := make([]models.Endpoint, 0)
 
+	// Resolve the iterated table and bind the loop variables, which is the only
+	// way to name the handler each entry registers. This runs first so that when
+	// the same registration is also found by one of the older detectors below,
+	// the entry with the resolved callback is the one deduplication keeps.
+	endpoints = append(endpoints, detectHookTableRegistrations(content, filepath, pluginSlug)...)
+
 	// Search for the WooCommerce-style pattern
 	// where an array of action names is defined, then a foreach loop registers them
 	endpoints = append(endpoints, detectWooCommerceStyleAJAX(content, filepath, pluginSlug)...)
@@ -2568,13 +2626,21 @@ func detectWooCommerceStyleAJAX(content, filepath, pluginSlug string) []models.E
 		)
 
 		loopVar := ""
+		keysOnly := false
 		foreachMatch := foreachSimplePattern.FindStringSubmatch(afterArray)
 		if foreachMatch != nil && len(foreachMatch) >= 2 {
 			loopVar = foreachMatch[1]
 		} else {
 			foreachMatch = foreachAssocPattern.FindStringSubmatch(afterArray)
 			if foreachMatch != nil && len(foreachMatch) >= 2 {
-				loopVar = foreachMatch[1] // In associative pattern, the key is the action name
+				loopVar = foreachMatch[1]
+				// This pattern binds the KEY, and the registration below is
+				// required to concatenate that same variable, so only the keys
+				// of this array can be actions. Harvesting every quoted string
+				// in the array turned a table of 'ACTION' => 'both' entries into
+				// endpoints named "both" and "admin" -- routes no request can
+				// ever carry, with callbacks that name nothing.
+				keysOnly = true
 			}
 		}
 
@@ -2620,6 +2686,9 @@ func detectWooCommerceStyleAJAX(content, filepath, pluginSlug string) []models.E
 			}
 
 			action := actionM[1]
+			if keysOnly && !isArrayKey(arrayContent, action) {
+				continue
+			}
 			fullAction := prefix + action
 
 			authLevel := models.Subscriber
@@ -2647,6 +2716,33 @@ func detectWooCommerceStyleAJAX(content, filepath, pluginSlug string) []models.E
 	}
 
 	return endpoints
+}
+
+// isArrayKey reports whether a quoted string appears as a KEY in an array
+// literal, i.e. is followed by "=>". PHP binds the key to the first name of a
+// `foreach ( $a as $k => $v )` header, so when the registration concatenates
+// that name only the keys can be action names.
+func isArrayKey(arrayContent, name string) bool {
+	for i := 0; i < len(arrayContent); {
+		j := strings.Index(arrayContent[i:], name)
+		if j < 0 {
+			return false
+		}
+		at := i + j
+		i = at + len(name)
+		if at == 0 || (arrayContent[at-1] != '\'' && arrayContent[at-1] != '"') {
+			continue
+		}
+		k := i
+		if k >= len(arrayContent) || (arrayContent[k] != '\'' && arrayContent[k] != '"') {
+			continue
+		}
+		k = skipSpace(arrayContent, k+1)
+		if k+1 < len(arrayContent) && arrayContent[k] == '=' && arrayContent[k+1] == '>' {
+			return true
+		}
+	}
+	return false
 }
 
 // detectInlineArrayForeachAJAX handles the pattern where an inline array is used directly in a foreach
@@ -2832,4 +2928,1434 @@ func DetectAJAXEndpointsWithAST(content, filepath string, pluginSlug string, ast
 	}
 
 	return endpoints
+}
+
+// ---------------------------------------------------------------------------
+// Hook names and callbacks are values, not spellings
+// ---------------------------------------------------------------------------
+//
+// WordPress dispatches on the VALUE of a string: admin-ajax.php runs
+// do_action( 'wp_ajax_' . $_REQUEST['action'] ), so 'wp_ajax_um_' . $action and
+// "wp_ajax_{$action}" and $full (assigned 'wp_ajax_' . $x a line earlier) are
+// the same registration written three ways. PHP has one string type and one
+// concatenation operator, and it folds 'a' . 'b' before add_action ever sees it.
+//
+// A detector built from one regex per spelling is matching syntax where
+// WordPress matches value, and it fails in the direction that costs most: an
+// unrecognised spelling produces NO endpoint, so the handler behind it is never
+// examined at all. The same is true of the callback: whether it is a string, an
+// array, a Closure, a static Closure, an arrow function, __CLASS__ . '::m' or a
+// variable, the registration is equally real and the hook name is equally
+// extractable. Coupling the two means an unrecognised callback discards a known
+// entry point.
+//
+// So the code below evaluates instead of matching. The regex detectors above are
+// kept and run first: this pass only looks at call sites none of them claimed,
+// which means it can add endpoints but never take one away.
+
+// coreDispatchFamilies are the hook-name prefixes WordPress core itself turns
+// into an HTTP entry point, longest first so that the nopriv halves win.
+//
+//	wp-admin/admin-ajax.php   wp_ajax_{$action} / wp_ajax_nopriv_{$action}
+//	wp-admin/admin-post.php   admin_post_{$action} / admin_post_nopriv_{$action}
+//	wp-admin/admin.php        admin_action_{$action}
+//
+// Third-party dispatchers (wc_ajax_, woocommerce_api_ and the rest) are not
+// here. They are fired by a plugin, not by core, so "any plugin that writes X
+// has created an endpoint" is not a statement anyone can make about them; the
+// pattern detectors above keep whatever support they already had.
+var coreDispatchFamilies = []string{
+	"wp_ajax_nopriv_",
+	"wp_ajax_",
+	"admin_post_nopriv_",
+	"admin_post_",
+	"admin_action_",
+}
+
+// coreFiltersUnderDispatchPrefix are WordPress core FILTER names that happen to
+// begin with one of the dispatch prefixes. Core fires both of these from
+// _wp_post_thumbnail_html() to filter markup; neither is a request entry point,
+// and a plugin filtering one has registered no endpoint. They are listed here by
+// their core names rather than harvested from a corpus.
+var coreFiltersUnderDispatchPrefix = map[string]bool{
+	"admin_post_thumbnail_html": true,
+	"admin_post_thumbnail_size": true,
+}
+
+// coreDispatchFamily reports which core dispatcher a folded hook name belongs
+// to, if any.
+func coreDispatchFamily(hook string) (string, bool) {
+	if coreFiltersUnderDispatchPrefix[hook] {
+		return "", false
+	}
+	for _, family := range coreDispatchFamilies {
+		if !strings.HasPrefix(hook, family) || len(hook) <= len(family) {
+			continue
+		}
+		// "wp_ajax_nopriv_" with nothing after it is the anonymous family with
+		// an empty action, not the privileged family with the action "nopriv_".
+		// Reading it the second way would report an anonymous registration at
+		// the privileged level, which is the error direction that hides a
+		// reachable vulnerability.
+		if strings.HasPrefix(hook[len(family):], "nopriv_") {
+			continue
+		}
+		return family, true
+	}
+	return "", false
+}
+
+// dispatchFamilyLevel is the privilege WordPress core requires of a caller to
+// reach a handler on this family, and nothing more.
+//
+// The action name is NOT consulted. It was already spent identifying the family,
+// and re-reading it as a privilege signal has no basis in core: do_action does
+// not inspect $action for English words. That matters most here, because a name
+// recovered by evaluation is exactly the kind that carries a plugin's own
+// namespace prefix.
+func dispatchFamilyLevel(family string) models.AuthLevel {
+	if hookIsAnonymousDispatch(family) {
+		return models.Unauthenticated
+	}
+	return models.Subscriber
+}
+
+// skipPHPNonCode advances past a quoted string or a comment beginning at i and
+// returns the offset of the first byte after it, or i+1 when i begins neither.
+func skipPHPNonCode(content string, i int) int {
+	switch content[i] {
+	case '\'', '"':
+		quote := content[i]
+		for j := i + 1; j < len(content); j++ {
+			if content[j] == '\\' {
+				j++
+				continue
+			}
+			if content[j] == quote {
+				return j + 1
+			}
+		}
+		return len(content)
+	case '#':
+		if k := strings.IndexAny(content[i:], "\r\n"); k >= 0 {
+			return i + k
+		}
+		return len(content)
+	case '/':
+		if i+1 < len(content) && content[i+1] == '/' {
+			if k := strings.IndexAny(content[i:], "\r\n"); k >= 0 {
+				return i + k
+			}
+			return len(content)
+		}
+		if i+1 < len(content) && content[i+1] == '*' {
+			if k := strings.Index(content[i+2:], "*/"); k >= 0 {
+				return i + 2 + k + 2
+			}
+			return len(content)
+		}
+	}
+	return i + 1
+}
+
+// maxCallScan bounds the balanced scan of one argument list. The longest
+// add_action argument list in the 143-tree corpus is a few hundred bytes; the
+// bound exists so that an unbalanced parenthesis in a malformed file costs a
+// scan of this length rather than of the file.
+const maxCallScan = 20000
+
+// phpArgList splits the argument list whose opening parenthesis is at
+// content[open] on its top-level commas, and returns the offset just past the
+// closing parenthesis. Quoted strings, comments and nested (), [] and {} are
+// skipped, so an argument may itself be an array literal or a closure.
+func phpArgList(content string, open int) (args []string, end int, ok bool) {
+	if open >= len(content) || content[open] != '(' {
+		return nil, 0, false
+	}
+	limit := open + maxCallScan
+	if limit > len(content) {
+		limit = len(content)
+	}
+	depth := 0
+	start := open + 1
+	for i := open; i < limit; {
+		switch content[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(content, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch content[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth <= 0 {
+				if content[i] != ')' {
+					return nil, 0, false
+				}
+				args = append(args, strings.TrimSpace(content[start:i]))
+				return args, i + 1, true
+			}
+		case ',':
+			if depth == 1 {
+				args = append(args, strings.TrimSpace(content[start:i]))
+				start = i + 1
+			}
+		}
+		i++
+	}
+	return nil, 0, false
+}
+
+// splitTopLevelConcat splits a PHP expression on the "." operators that are not
+// inside a string, a comment or a nested bracket.
+func splitTopLevelConcat(expr string) []string {
+	terms := make([]string, 0, 4)
+	depth := 0
+	start := 0
+	for i := 0; i < len(expr); {
+		switch expr[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(expr, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch expr[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case '.':
+			// A dot inside a number is not concatenation, and neither is the
+			// "?->" null-safe operator's arrow.
+			if depth == 0 && (i == 0 || !isPHPDigit(expr[i-1]) || i+1 >= len(expr) || !isPHPDigit(expr[i+1])) {
+				terms = append(terms, expr[start:i])
+				start = i + 1
+			}
+		}
+		i++
+	}
+	terms = append(terms, expr[start:])
+	return terms
+}
+
+func isPHPDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func isPHPNameByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// foldPHPExpr evaluates a PHP string expression to the value PHP would build.
+//
+// subst carries bindings that are known from context -- a foreach loop's
+// variables, say. Terms that cannot be evaluated are rendered as a {name}
+// placeholder and reported by the second return value, so the caller can still
+// emit the endpoint and annotate the route as dynamic rather than dropping it.
+func foldPHPExpr(expr string, subst map[string]string, content string, scope string) (string, bool) {
+	var b strings.Builder
+	resolved := true
+	for _, term := range splitTopLevelConcat(expr) {
+		value, ok := foldPHPTerm(strings.TrimSpace(term), subst, content, scope, 0)
+		if !ok {
+			resolved = false
+		}
+		b.WriteString(value)
+	}
+	return b.String(), resolved
+}
+
+// maxFoldDepth bounds how far foldPHPTerm will chase a variable through its
+// assignments. Two is enough for the shape this exists for ($full = 'wp_ajax_' .
+// $action; add_action($full, ...)) and stops a cyclic assignment dead.
+const maxFoldDepth = 2
+
+func foldPHPTerm(term string, subst map[string]string, content, scope string, depth int) (string, bool) {
+	if term == "" {
+		return "", true
+	}
+
+	// A single-quoted literal is its own value; PHP does not interpolate it.
+	if len(term) >= 2 && term[0] == '\'' && term[len(term)-1] == '\'' {
+		return term[1 : len(term)-1], true
+	}
+
+	// A double-quoted literal interpolates. cleanActionName renders $x and
+	// {$x} as {x}, which is exactly the placeholder shape used elsewhere, so
+	// any binding we do know can then be substituted into it.
+	if len(term) >= 2 && term[0] == '"' && term[len(term)-1] == '"' {
+		value := cleanActionName(term[1 : len(term)-1])
+		value = applySubstitutions(value, subst)
+		return value, !strings.Contains(value, "{")
+	}
+
+	// $this->property and self::$property: a class property is class-scoped, so
+	// the whole file is the right place to look for its assignment.
+	if name, ok := propertyTermName(term); ok {
+		if value, ok := subst["this->"+name]; ok {
+			return value, true
+		}
+		if value, found := lastStringAssignment(content, "this->"+name); found {
+			return value, true
+		}
+		if value, found := declaredPropertyString(content, name); found {
+			return value, true
+		}
+		return "{" + name + "}", false
+	}
+
+	// A plain variable. PHP binds a variable within one function body, so the
+	// assignment is looked for in the enclosing function only -- a file-wide
+	// backward scan would happily attach an unrelated function's value.
+	if len(term) > 1 && term[0] == '$' && isPHPNameByte(term[1]) && !strings.ContainsAny(term, "[]->(") {
+		name := term[1:]
+		if value, ok := subst[name]; ok {
+			// A binding whose value could not be read is bound to SOMETHING,
+			// so folding it away to the empty string would silently truncate
+			// the hook name -- 'wp_ajax_nopriv_' . $name became the bare family
+			// prefix. Report it unresolved instead.
+			return value, value != ""
+		}
+		if value, found := lastStringAssignment(scope, name); found {
+			return value, true
+		}
+		if depth < maxFoldDepth {
+			if rhs, found := lastAssignmentRHS(scope, name, 500); found {
+				if value, ok := foldNestedExpr(rhs, subst, content, scope, depth+1); ok {
+					return value, true
+				}
+			}
+		}
+		return "{" + name + "}", false
+	}
+
+	// self::CONST, static::CONST, ClassName::CONST. Class constants are
+	// file-scoped for our purposes, like properties.
+	if idx := strings.Index(term, "::"); idx > 0 && !strings.Contains(term, "(") {
+		constName := strings.TrimSpace(term[idx+2:])
+		if constName != "" && constName != "class" {
+			if value, found := declaredConstantString(content, constName); found {
+				return value, true
+			}
+			return "{" + constName + "}", false
+		}
+	}
+
+	return "{" + placeholderName(term) + "}", false
+}
+
+// foldNestedExpr folds a whole expression at depth, used when a variable's
+// assignment is itself a concatenation.
+func foldNestedExpr(expr string, subst map[string]string, content, scope string, depth int) (string, bool) {
+	var b strings.Builder
+	resolved := true
+	for _, term := range splitTopLevelConcat(expr) {
+		value, ok := foldPHPTerm(strings.TrimSpace(term), subst, content, scope, depth)
+		if !ok {
+			resolved = false
+		}
+		b.WriteString(value)
+	}
+	return b.String(), resolved
+}
+
+// applySubstitutions replaces {name} placeholders with any binding we hold.
+func applySubstitutions(value string, subst map[string]string) string {
+	if len(subst) == 0 || !strings.Contains(value, "{") {
+		return value
+	}
+	for name, bound := range subst {
+		value = strings.ReplaceAll(value, "{"+name+"}", bound)
+	}
+	return value
+}
+
+// placeholderName reduces an expression we cannot evaluate to something usable
+// as a {placeholder}: the last identifier in it, or "expr".
+func placeholderName(term string) string {
+	end := len(term)
+	for end > 0 && !isPHPNameByte(term[end-1]) {
+		end--
+	}
+	start := end
+	for start > 0 && isPHPNameByte(term[start-1]) {
+		start--
+	}
+	if start < end {
+		return term[start:end]
+	}
+	return "expr"
+}
+
+// propertyTermName recognises $this->prop, self::$prop and static::$prop.
+func propertyTermName(term string) (string, bool) {
+	for _, prefix := range []string{"$this->", "self::$", "static::$"} {
+		if strings.HasPrefix(term, prefix) {
+			name := strings.TrimSpace(term[len(prefix):])
+			if name != "" && !strings.ContainsAny(name, "[]->()$") {
+				return name, true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// lastStringAssignment returns the value of the LAST `$name = 'literal'` in
+// window. The last one, not the first: a file that reuses a variable name would
+// otherwise be read backwards.
+func lastStringAssignment(window, name string) (string, bool) {
+	needle := "$" + name
+	value := ""
+	found := false
+	for i := 0; i < len(window); {
+		j := strings.Index(window[i:], needle)
+		if j < 0 {
+			break
+		}
+		pos := i + j
+		i = pos + len(needle)
+		if pos > 0 && (isPHPNameByte(window[pos-1]) || window[pos-1] == '$') {
+			continue
+		}
+		if i < len(window) && isPHPNameByte(window[i]) {
+			continue
+		}
+		k := skipSpace(window, i)
+		if k >= len(window) || window[k] != '=' {
+			continue
+		}
+		if k+1 < len(window) && (window[k+1] == '=' || window[k+1] == '>') {
+			continue
+		}
+		k = skipSpace(window, k+1)
+		if k >= len(window) || (window[k] != '\'' && window[k] != '"') {
+			continue
+		}
+		end := skipPHPNonCode(window, k)
+		if end <= k+1 || end > len(window) {
+			continue
+		}
+		// The literal must BE the right-hand side. `$x = 'wp_ajax_' . $y;`
+		// starts with a literal too, and taking it would report half a value as
+		// if it were the whole one; that expression belongs to the concatenation
+		// path instead.
+		after := skipSpace(window, end)
+		if after < len(window) && window[after] != ';' && window[after] != ',' && window[after] != ')' {
+			continue
+		}
+		value = window[k+1 : end-1]
+		found = true
+	}
+	return value, found
+}
+
+// lastAssignmentRHS returns the text of the LAST `$name = ...` right-hand side
+// in window, up to the semicolon that closes it. Brackets are tracked, so a
+// multi-line array literal comes back whole.
+func lastAssignmentRHS(window, name string, limit int) (string, bool) {
+	needle := "$" + name
+	rhs := ""
+	found := false
+	for i := 0; i < len(window); {
+		j := strings.Index(window[i:], needle)
+		if j < 0 {
+			break
+		}
+		pos := i + j
+		i = pos + len(needle)
+		if pos > 0 && (isPHPNameByte(window[pos-1]) || window[pos-1] == '$') {
+			continue
+		}
+		if i < len(window) && isPHPNameByte(window[i]) {
+			continue
+		}
+		k := skipSpace(window, i)
+		if k >= len(window) || window[k] != '=' {
+			continue
+		}
+		if k+1 < len(window) && (window[k+1] == '=' || window[k+1] == '>') {
+			continue
+		}
+		k = skipSpace(window, k+1)
+		end := k
+		stop := k + limit
+		if stop > len(window) {
+			stop = len(window)
+		}
+		depth := 0
+		for end < stop {
+			switch window[end] {
+			case '\'', '"', '#', '/':
+				if next := skipPHPNonCode(window, end); next > end {
+					end = next
+					continue
+				}
+			}
+			if window[end] == ';' && depth == 0 {
+				break
+			}
+			switch window[end] {
+			case '(', '[', '{':
+				depth++
+			case ')', ']', '}':
+				depth--
+				if depth < 0 {
+					stop = end
+				}
+			}
+			end++
+		}
+		if end > k {
+			rhs = strings.TrimSpace(window[k:end])
+			found = true
+		}
+	}
+	return rhs, found
+}
+
+// declaredPropertyString finds `public|protected|private $prop = 'value'`.
+func declaredPropertyString(content, name string) (string, bool) {
+	for _, keyword := range []string{"public", "protected", "private", "var"} {
+		idx := 0
+		for {
+			j := strings.Index(content[idx:], keyword+" ")
+			if j < 0 {
+				break
+			}
+			pos := idx + j
+			idx = pos + len(keyword)
+			rest := skipSpace(content, pos+len(keyword))
+			if value, ok := matchStringAssignmentAt(content, rest, name); ok {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// matchStringAssignmentAt checks for `$name = 'value'` starting at pos.
+func matchStringAssignmentAt(content string, pos int, name string) (string, bool) {
+	needle := "$" + name
+	if !strings.HasPrefix(content[pos:], needle) {
+		return "", false
+	}
+	k := pos + len(needle)
+	if k < len(content) && isPHPNameByte(content[k]) {
+		return "", false
+	}
+	k = skipSpace(content, k)
+	if k >= len(content) || content[k] != '=' {
+		return "", false
+	}
+	k = skipSpace(content, k+1)
+	if k >= len(content) || (content[k] != '\'' && content[k] != '"') {
+		return "", false
+	}
+	end := skipPHPNonCode(content, k)
+	if end <= k+1 {
+		return "", false
+	}
+	return content[k+1 : end-1], true
+}
+
+// declaredConstantString finds `const NAME = 'value'`.
+func declaredConstantString(content, name string) (string, bool) {
+	idx := 0
+	for {
+		j := strings.Index(content[idx:], "const ")
+		if j < 0 {
+			return "", false
+		}
+		pos := idx + j
+		idx = pos + 6
+		k := skipSpace(content, idx)
+		if !strings.HasPrefix(content[k:], name) {
+			continue
+		}
+		k += len(name)
+		if k < len(content) && isPHPNameByte(content[k]) {
+			continue
+		}
+		k = skipSpace(content, k)
+		if k >= len(content) || content[k] != '=' {
+			continue
+		}
+		k = skipSpace(content, k+1)
+		if k >= len(content) || (content[k] != '\'' && content[k] != '"') {
+			continue
+		}
+		end := skipPHPNonCode(content, k)
+		if end > k+1 {
+			return content[k+1 : end-1], true
+		}
+	}
+}
+
+// maxScopeLookBack bounds the search for the head of the enclosing function.
+// A PHP function longer than this is not something a backward scan should pay
+// for on every registration in a large file; the window that remains is still
+// narrower than the file, so the failure mode stays under-resolution.
+const maxScopeLookBack = 20000
+
+// enclosingFunctionScope returns the slice of content that a plain variable's
+// assignment may be looked for in: from the head of the function containing pos
+// up to pos itself.
+//
+// PHP binds a variable within one function body, so this is the scope the
+// language actually gives it. A file-wide backward scan would cheerfully attach
+// an unrelated function's assignment to this registration and mis-name the
+// endpoint, which is worse than leaving it as an unresolved placeholder.
+func enclosingFunctionScope(content string, pos int) string {
+	if pos > len(content) {
+		pos = len(content)
+	}
+	limit := pos - maxScopeLookBack
+	if limit < 0 {
+		limit = 0
+	}
+	for at := pos; at > limit; {
+		j := strings.LastIndex(content[limit:at], "function")
+		if j < 0 {
+			break
+		}
+		at = limit + j
+		if (at == 0 || !isPHPNameByte(content[at-1])) &&
+			(at+8 >= len(content) || !isPHPNameByte(content[at+8])) {
+			return content[at:pos]
+		}
+	}
+	return content[limit:pos]
+}
+
+// parsePHPCallable turns the callback arguments of a registration into a name
+// the call graph can key on.
+//
+// PHP accepts any callable in that position -- a string, an array, a Closure, a
+// static Closure, an arrow function, or a variable holding one of those -- and
+// the language keeps adding to that list, so this reads the shape rather than
+// enumerating spellings. An argument it cannot name still yields an endpoint:
+// an endpoint with an unresolved callback is worth strictly more than no
+// endpoint at all, and marking it unresolved (rather than passing the raw text
+// through) keeps a fragment like "$plugin_admin" from being mistaken downstream
+// for a symbol.
+func parsePHPCallable(args []string, subst map[string]string, content, scope string) string {
+	if len(args) < 2 {
+		return "unknown"
+	}
+	return parseCallableExpr(strings.TrimSpace(args[1]), args, subst, content, scope, 0)
+}
+
+// parseCallableExpr names one callable expression. args is passed through only
+// so that the loader's (component, 'method') pair can be read; depth bounds the
+// chase through a variable that holds the callable.
+func parseCallableExpr(expr string, args []string, subst map[string]string, content, scope string, depth int) string {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return "unknown"
+	}
+
+	// A closure, static closure or arrow function. "closure" is the sentinel
+	// the call graph resolves by reading the file's registration closures, so
+	// the body behind it is still walked.
+	trimmed := strings.TrimPrefix(expr, "static ")
+	trimmed = strings.TrimSpace(trimmed)
+	if strings.HasPrefix(trimmed, "function") || strings.HasPrefix(trimmed, "fn(") ||
+		strings.HasPrefix(trimmed, "fn (") {
+		return "closure"
+	}
+
+	// [ $obj, 'method' ] and array( $obj, 'method' ), including the forms whose
+	// method name is itself an expression: array( $this, $method . '_callback' ).
+	if strings.HasPrefix(expr, "[") || strings.HasPrefix(expr, "array") {
+		if folded, ok := foldArrayCallable(expr, subst, content, scope); ok {
+			return NormalizeCallback(folded)
+		}
+		return NormalizeCallback(expr)
+	}
+
+	// A bare object variable is a callable only if its class defines __invoke.
+	// When a literal method name follows it, the callable is the pair -- that is
+	// the WordPress-Plugin-Boilerplate loader's three-argument shape, where
+	// argument 1 is the component and argument 2 is the method.
+	if len(expr) > 1 && expr[0] == '$' && !strings.ContainsAny(expr, "[]->(.:") {
+		if len(args) >= 3 {
+			if method, ok := singleQuotedLiteral(strings.TrimSpace(args[2])); ok {
+				return NormalizeCallback(method)
+			}
+		}
+		if value, ok := foldPHPExpr(expr, subst, content, scope); ok && value != "" {
+			return NormalizeCallback(value)
+		}
+		// $cb = array( $this, 'handler' ); add_action( 'wp_ajax_x', $cb );
+		// The variable holds the callable, so its assignment is the callable.
+		if depth < maxFoldDepth {
+			if rhs, found := lastAssignmentRHS(scope, expr[1:], 500); found {
+				if name := parseCallableExpr(rhs, nil, subst, content, scope, depth+1); name != "unknown" {
+					return name
+				}
+			}
+		}
+		return "unknown"
+	}
+
+	folded, ok := foldPHPExpr(expr, subst, content, scope)
+	if !ok || folded == "" || strings.Contains(folded, "{") {
+		// __CLASS__ . '::method' and self::class . '::method' fold to a class
+		// term we cannot name plus a method we can; keep the method, which is
+		// what the call graph keys on anyway.
+		if method, ok := trailingScopedMethod(expr); ok {
+			return NormalizeCallback(method)
+		}
+		return "unknown"
+	}
+	return NormalizeCallback(folded)
+}
+
+// normalizeCallbackExpr names a callback expression captured by one of the
+// pattern detectors, folding it first.
+//
+// PHP evaluates 'ajax_' . 'X' to ajax_X before add_action ever sees it, so
+// reporting the unevaluated source text as the callback reports a string PHP
+// never produced -- and one carrying a quote and a dot inside it, which can key
+// no call-graph node. An endpoint whose callback names nothing reaches nothing,
+// which for the never-miss objective is indistinguishable from a missed
+// registration and worse than one, because it looks like coverage.
+//
+// When the expression cannot be named the previous result is kept rather than
+// replaced by a sentinel, so this can only improve on what a detector reported.
+func normalizeCallbackExpr(expr, content string, pos int) string {
+	if name := parseCallableExpr(expr, nil, nil, content, enclosingFunctionScope(content, pos), 0); name != "unknown" {
+		return name
+	}
+	return NormalizeCallback(expr)
+}
+
+// foldArrayCallable folds the method term of an array callable and rebuilds the
+// array so that NormalizeCallback -- which already knows $this, __CLASS__,
+// self:: and ClassName::class -- can name it.
+func foldArrayCallable(expr string, subst map[string]string, content, scope string) (string, bool) {
+	open := strings.IndexAny(expr, "[(")
+	if open < 0 {
+		return "", false
+	}
+	var inner string
+	if expr[open] == '[' {
+		shut := matchingBracket(expr, open)
+		if shut < 0 {
+			return "", false
+		}
+		inner = expr[open+1 : shut]
+	} else {
+		args, _, ok := phpArgList(expr, open)
+		if !ok {
+			return "", false
+		}
+		inner = strings.Join(args, ",")
+	}
+	parts := make([]string, 0, 2)
+	for _, part := range splitTopLevelArgs(inner) {
+		if strings.TrimSpace(part) != "" {
+			parts = append(parts, part)
+		}
+	}
+	// A trailing comma is legal PHP and common in a multi-line array literal,
+	// so an empty last element is not a third argument.
+	if len(parts) != 2 {
+		return "", false
+	}
+	method, resolved := foldPHPExpr(strings.TrimSpace(parts[1]), subst, content, scope)
+	if !resolved || method == "" || strings.ContainsAny(method, "{}$") {
+		return "", false
+	}
+	return "array(" + strings.TrimSpace(parts[0]) + ", '" + method + "')", true
+}
+
+// splitTopLevelArgs splits an already-unwrapped argument list on top-level
+// commas.
+func splitTopLevelArgs(inner string) []string {
+	parts := make([]string, 0, 2)
+	depth := 0
+	start := 0
+	for i := 0; i < len(inner); {
+		switch inner[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(inner, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch inner[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, inner[start:i])
+				start = i + 1
+			}
+		}
+		i++
+	}
+	parts = append(parts, inner[start:])
+	return parts
+}
+
+// matchingBracket returns the offset of the ']' closing the '[' at open.
+func matchingBracket(s string, open int) int {
+	depth := 0
+	limit := open + maxCallScan
+	if limit > len(s) {
+		limit = len(s)
+	}
+	for i := open; i < limit; {
+		switch s[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(s, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch s[i] {
+		case '[', '(', '{':
+			depth++
+		case ']', ')', '}':
+			depth--
+			if depth == 0 {
+				if s[i] != ']' {
+					return -1
+				}
+				return i
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+// trimLeadingPHPTrivia drops whitespace and comments from the front of an
+// expression. An array literal is commonly written with a comment above each
+// group of entries, and the comment belongs to the source, not to the value.
+func trimLeadingPHPTrivia(expr string) string {
+	for {
+		trimmed := strings.TrimSpace(expr)
+		if len(trimmed) < 2 {
+			return trimmed
+		}
+		if trimmed[0] == '#' || (trimmed[0] == '/' && (trimmed[1] == '/' || trimmed[1] == '*')) {
+			next := skipPHPNonCode(trimmed, 0)
+			if next <= 0 || next >= len(trimmed) {
+				return ""
+			}
+			expr = trimmed[next:]
+			continue
+		}
+		return trimmed
+	}
+}
+
+// singleQuotedLiteral returns the content of a quoted string argument.
+func singleQuotedLiteral(expr string) (string, bool) {
+	expr = trimLeadingPHPTrivia(expr)
+	if len(expr) >= 2 && (expr[0] == '\'' || expr[0] == '"') && expr[len(expr)-1] == expr[0] {
+		value := expr[1 : len(expr)-1]
+		if value != "" && !strings.ContainsAny(value, "$'\"") {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+// trailingScopedMethod picks the method out of __CLASS__ . '::method'.
+func trailingScopedMethod(expr string) (string, bool) {
+	folded := ""
+	for _, term := range splitTopLevelConcat(expr) {
+		if value, ok := singleQuotedLiteral(strings.TrimSpace(term)); ok {
+			folded += value
+		}
+	}
+	if idx := strings.LastIndex(folded, "::"); idx >= 0 {
+		method := folded[idx+2:]
+		if method != "" {
+			return method, true
+		}
+	}
+	return "", false
+}
+
+// registrationCallHeads finds every add_action / add_filter call in content and
+// returns the offset of the name and of its opening parenthesis.
+//
+// A call written $obj->add_action(...) or Klass::add_action(...) is skipped:
+// that is some object's own method, not the global function WordPress defines,
+// and the detectors above already own the loader and framework shapes it stands
+// for. add_filter is included because wp-includes/plugin.php defines add_action
+// as `return add_filter( $hook_name, $callback, $priority, $accepted_args );`
+// and do_action runs whatever sits in $wp_filter[$hook] regardless of which
+// alias put it there -- so for a request-dispatch hook the two are the same
+// registration.
+func registrationCallHeads(content string) [][2]int {
+	heads := make([][2]int, 0, 16)
+	for _, name := range []string{"add_action", "add_filter"} {
+		idx := 0
+		for {
+			j := strings.Index(content[idx:], name)
+			if j < 0 {
+				break
+			}
+			at := idx + j
+			idx = at + len(name)
+			if at > 0 && isPHPNameByte(content[at-1]) {
+				continue
+			}
+			before := at
+			for before > 0 && (content[before-1] == ' ' || content[before-1] == '\t' ||
+				content[before-1] == '\r' || content[before-1] == '\n') {
+				before--
+			}
+			if before >= 2 && (content[before-2:before] == "->" || content[before-2:before] == "::") {
+				continue
+			}
+			open := skipSpace(content, idx)
+			if open >= len(content) || content[open] != '(' {
+				continue
+			}
+			heads = append(heads, [2]int{at, open})
+		}
+	}
+	return heads
+}
+
+// detectEvaluatedHookRegistrations emits an endpoint for every add_action or
+// add_filter call on a core dispatch hook that none of the pattern detectors
+// above claimed.
+//
+// It runs last and only over unclaimed positions, so it can add an endpoint but
+// never displace one. What it recovers is the registrations whose hook name is a
+// value rather than a single quoted token -- 'wp_ajax_um_' . $action, or a name
+// assembled into a variable a line earlier -- and the ones whose callback is
+// written in a shape the hook patterns did not enumerate, such as a static
+// closure, an arrow function, __CLASS__ . '::method' or a variable.
+func detectEvaluatedHookRegistrations(content, filepath, pluginSlug string, processed map[int]bool, out *ajaxEndpointList) {
+	for _, head := range registrationCallHeads(content) {
+		if processed[head[0]] {
+			continue
+		}
+		args, end, ok := phpArgList(content, head[1])
+		if !ok || len(args) < 2 {
+			continue
+		}
+
+		scope := enclosingFunctionScope(content, head[0])
+		hook, resolved := foldPHPExpr(args[0], nil, content, scope)
+		family, isDispatch := coreDispatchFamily(hook)
+		if !isDispatch {
+			continue
+		}
+		processed[head[0]] = true
+
+		rawCode := truncateCode(content[head[0]:end], 500)
+		if !resolved {
+			// The route keeps its {placeholder} and the annotation records the
+			// expression, so the dataflow pass downstream can still resolve it.
+			rawCode += " [dynamic:unresolved:" + strings.TrimSpace(args[0]) + "]"
+		}
+
+		out.add(models.Endpoint{
+			PluginSlug: pluginSlug,
+			Type:       models.EndpointTypeAJAX,
+			Route:      formatAjaxRoute(hook),
+			Method:     "POST",
+			AuthLevel:  dispatchFamilyLevel(family),
+			Callback:   parsePHPCallable(args, nil, content, scope),
+			File:       filepath,
+			Line:       countLines(content[:head[0]]) + 1,
+			RawCode:    rawCode,
+		}, family)
+	}
+}
+
+// maxTableEntries bounds how many endpoints one iterated table may expand to.
+// The largest table in the 143-tree corpus holds 58 entries; the bound is there
+// so that a pathological array cannot inflate the graph.
+const maxTableEntries = 200
+
+// maxTableEndpointsPerFile bounds the whole pass for one file.
+const maxTableEndpointsPerFile = 600
+
+// detectHookTableRegistrations recovers the registrations a plugin makes by
+// iterating a table of actions:
+//
+//	$this->ajax = array( 'astra-sites-api-request' => 'api_request', ... );
+//	foreach ( $this->ajax as $ajax_hook => $ajax_callback ) {
+//	    add_action( 'wp_ajax_' . $ajax_hook, array( $this, $ajax_callback ) );
+//	}
+//
+// It is one endpoint per table entry, by PHP's own semantics: foreach binds its
+// variables to each element before the body runs, and WordPress then dispatches
+// admin-ajax.php on the resulting hook name. The two older foreach detectors are
+// kept and run after this one, so nothing they find can be lost; what they
+// cannot do is read a table held in a class property, take the callback out of
+// the table, or bind the key and the value separately.
+//
+// The bindings are followed rather than guessed. Which loop variable supplies
+// the action is decided by which one the hook expression names, and likewise for
+// the callback -- "the key is the action" happens to hold for every associative
+// table in this corpus, but it is a fact about these plugins, not about PHP, and
+// a table that maps label => action would be silently mis-named by it.
+func detectHookTableRegistrations(content, filepath, pluginSlug string) []models.Endpoint {
+	// Cheap gate before any table resolution: a foreach is only interesting if
+	// its body registers something on a core dispatch hook.
+	if !strings.Contains(content, "foreach") ||
+		(!strings.Contains(content, "wp_ajax_") &&
+			!strings.Contains(content, "admin_post_") &&
+			!strings.Contains(content, "admin_action_")) {
+		return nil
+	}
+
+	out := ajaxEndpointList{}
+	fallbacks := make([]string, 0, 16)
+
+	for _, loop := range findForeachLoops(content) {
+		if len(out.eps) >= maxTableEndpointsPerFile {
+			break
+		}
+		body := content[loop.bodyStart:loop.bodyEnd]
+		if !strings.Contains(body, "add_action") && !strings.Contains(body, "add_filter") {
+			continue
+		}
+
+		registrations := make([][]string, 0, 4)
+		for _, head := range registrationCallHeads(body) {
+			args, _, ok := phpArgList(body, head[1])
+			if ok && len(args) >= 2 {
+				registrations = append(registrations, args)
+			}
+		}
+		if len(registrations) == 0 {
+			continue
+		}
+
+		table, ok := resolveHookTable(loop.source, content, loop.start)
+		if !ok || len(table) == 0 {
+			continue
+		}
+		if len(table) > maxTableEntries {
+			table = table[:maxTableEntries]
+		}
+
+		scope := enclosingFunctionScope(content, loop.start)
+		lineNum := countLines(content[:loop.start]) + 1
+
+		for _, entry := range table {
+			subst := map[string]string{}
+			if loop.keyVar != "" {
+				subst[loop.keyVar] = entry[0]
+			}
+			if loop.valVar != "" {
+				subst[loop.valVar] = entry[1]
+			}
+
+			for _, args := range registrations {
+				hook, resolved := foldPHPExpr(args[0], subst, content, scope)
+				family, isDispatch := coreDispatchFamily(hook)
+				if !isDispatch || !resolved {
+					continue
+				}
+				action := strings.TrimPrefix(hook, family)
+
+				out.add(models.Endpoint{
+					PluginSlug: pluginSlug,
+					Type:       models.EndpointTypeAJAX,
+					Route:      formatAjaxRoute(hook),
+					Method:     "POST",
+					AuthLevel:  dispatchFamilyLevel(family),
+					Callback:   parsePHPCallable(args, subst, content, scope),
+					File:       filepath,
+					Line:       lineNum,
+					RawCode:    truncateCode(loop.source+" table iteration: "+action, 300),
+				}, family)
+				fallbacks = append(fallbacks, loopBinding(entry, loop, args[0]))
+
+				if len(out.eps) >= maxTableEndpointsPerFile {
+					break
+				}
+			}
+		}
+	}
+
+	// A table whose loop body registers both halves of the pair binds the same
+	// callback to both, so the privileged half describes no privilege. This is
+	// deliberately loop-scoped rather than per-entry: plugins commonly guard the
+	// nopriv registration with `if ( $nopriv )` on a flag from the table, and
+	// evaluating that flag per entry would raise three quarters of such a table
+	// back to Subscriber. Reporting the whole table as anonymously reachable
+	// under-restricts, which is the safe direction, and the endpoint carries the
+	// "[downgraded: has nopriv variant]" marker so the imprecision is visible.
+	out.correlateTwins()
+	out.enforceAnonymousDispatchFloor()
+
+	// Only now name the endpoints whose callback expression would not fold. The
+	// fallback is the table entry the hook itself was built from, which is what
+	// this detector has always reported and which is right whenever a plugin
+	// names its handler after its action -- measured, 254 of the 334 endpoints
+	// the older foreach detectors emit. A raw unfoldable expression would be
+	// worse than that guess, not better.
+	//
+	// It happens after the correlation on purpose. The fallback is a guess, not
+	// a name, and if it were in place during the correlation the two halves of a
+	// pair could be read as binding different handlers and the privileged half
+	// would keep a privilege the anonymous half disproves.
+	for i := range out.eps {
+		if _, named := comparableHandlerName(out.eps[i].Callback); named {
+			continue
+		}
+		if i < len(fallbacks) && fallbacks[i] != "" {
+			out.eps[i].Callback = NormalizeCallback(fallbacks[i])
+		}
+	}
+	return out.eps
+}
+
+// loopBinding returns the table entry half that the hook expression was built
+// from, which is the best available guess at the handler's name when the
+// callback expression itself will not fold.
+func loopBinding(entry [2]string, loop foreachLoop, hookExpr string) string {
+	if loop.keyVar != "" && strings.Contains(hookExpr, "$"+loop.keyVar) {
+		return entry[0]
+	}
+	if loop.valVar != "" && strings.Contains(hookExpr, "$"+loop.valVar) {
+		return entry[1]
+	}
+	if entry[0] != "" {
+		return entry[0]
+	}
+	return entry[1]
+}
+
+// foreachLoop is the parsed head and body span of one foreach statement.
+type foreachLoop struct {
+	start     int
+	source    string
+	keyVar    string
+	valVar    string
+	bodyStart int
+	bodyEnd   int
+}
+
+// findForeachLoops parses every foreach statement in content: its iterated
+// expression, its bound variable names and the span of its body.
+func findForeachLoops(content string) []foreachLoop {
+	loops := make([]foreachLoop, 0, 4)
+	idx := 0
+	for {
+		j := strings.Index(content[idx:], "foreach")
+		if j < 0 {
+			return loops
+		}
+		at := idx + j
+		idx = at + 7
+		if at > 0 && isPHPNameByte(content[at-1]) {
+			continue
+		}
+		if idx < len(content) && isPHPNameByte(content[idx]) {
+			continue
+		}
+		open := skipSpace(content, idx)
+		if open >= len(content) || content[open] != '(' {
+			continue
+		}
+		args, end, ok := phpArgList(content, open)
+		if !ok || len(args) == 0 {
+			continue
+		}
+		source, keyVar, valVar, ok := parseForeachHead(strings.Join(args, ","))
+		if !ok {
+			continue
+		}
+		bodyStart, bodyEnd, ok := foreachBodySpan(content, end)
+		if !ok {
+			continue
+		}
+		loops = append(loops, foreachLoop{
+			start: at, source: source, keyVar: keyVar, valVar: valVar,
+			bodyStart: bodyStart, bodyEnd: bodyEnd,
+		})
+		idx = end
+	}
+}
+
+// parseForeachHead splits "SRC as $k => $v" (or "SRC as $v") into its parts.
+// PHP binds the value in the single-variable form, so valVar is what is always
+// set and keyVar only when the pair form is written.
+func parseForeachHead(head string) (source, keyVar, valVar string, ok bool) {
+	lower := strings.ToLower(head)
+	at := -1
+	for i := 0; i+4 <= len(lower); i++ {
+		if lower[i:i+4] == " as " {
+			at = i
+			break
+		}
+	}
+	if at < 0 {
+		return "", "", "", false
+	}
+	source = strings.TrimSpace(head[:at])
+	bound := strings.TrimSpace(head[at+4:])
+	if source == "" || bound == "" {
+		return "", "", "", false
+	}
+	if arrow := strings.Index(bound, "=>"); arrow >= 0 {
+		keyVar = foreachVarName(bound[:arrow])
+		valVar = foreachVarName(bound[arrow+2:])
+	} else {
+		valVar = foreachVarName(bound)
+	}
+	if valVar == "" && keyVar == "" {
+		return "", "", "", false
+	}
+	return source, keyVar, valVar, true
+}
+
+// foreachVarName extracts the plain variable name from a foreach binding,
+// tolerating the by-reference form &$item. A binding that destructures into a
+// list is not a plain name and yields "".
+func foreachVarName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "&")
+	s = strings.TrimSpace(s)
+	if len(s) < 2 || s[0] != '$' {
+		return ""
+	}
+	name := s[1:]
+	for i := 0; i < len(name); i++ {
+		if !isPHPNameByte(name[i]) {
+			return ""
+		}
+	}
+	return name
+}
+
+// foreachBodySpan returns the span of a foreach body, whether it is braced, the
+// alternative endforeach syntax, or a single statement.
+func foreachBodySpan(content string, afterHead int) (start, end int, ok bool) {
+	i := skipSpace(content, afterHead)
+	if i >= len(content) {
+		return 0, 0, false
+	}
+	switch content[i] {
+	case '{':
+		shut := matchingBrace(content, i)
+		if shut < 0 {
+			return 0, 0, false
+		}
+		return i + 1, shut, true
+	case ':':
+		if k := strings.Index(content[i:], "endforeach"); k >= 0 {
+			return i + 1, i + k, true
+		}
+		return 0, 0, false
+	default:
+		if k := strings.IndexByte(content[i:], ';'); k >= 0 {
+			return i, i + k + 1, true
+		}
+		return 0, 0, false
+	}
+}
+
+// matchingBrace returns the offset of the '}' closing the '{' at open.
+func matchingBrace(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); {
+		switch s[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(s, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+// resolveHookTable resolves the expression a foreach iterates to a list of
+// (key, value) pairs.
+//
+// The variable-name filter the older detector used -- the array had to be called
+// something containing "ajax", "events", "actions" or "handlers" -- is not
+// applied. A variable name is a plugin's convention; what makes a table
+// interesting is that its loop registers a core dispatch hook, and that has
+// already been tested by the caller.
+func resolveHookTable(source, content string, foreachPos int) ([][2]string, bool) {
+	source = strings.TrimSpace(source)
+
+	// An array literal written straight into the foreach head, or the array
+	// argument of the call that wraps one: apply_filters( 'hook', array( ... ) )
+	// is the commonest way a plugin makes its own table filterable.
+	if pairs, ok := tablePairsFromExpr(source); ok {
+		return pairs, true
+	}
+
+	// A class property. Properties are class-scoped, so the whole file is the
+	// right window: the declaration and the constructor assignment are both
+	// usually far from the loop.
+	if name, ok := propertyTermName(source); ok {
+		if pairs, ok := tablePairsFromVar(content, "this->"+name); ok {
+			return pairs, true
+		}
+		if pairs, ok := tablePairsFromVar(content, name); ok {
+			return pairs, true
+		}
+		return nil, false
+	}
+
+	// A plain variable: PHP binds it inside one function body, so that is where
+	// its assignment is looked for. When the loop is not inside a function -- or
+	// the assignment sits above the enclosing function's head -- fall back to the
+	// positional window the older detector used, which is what it always had.
+	if len(source) > 1 && source[0] == '$' {
+		name := source[1:]
+		for i := 0; i < len(name); i++ {
+			if !isPHPNameByte(name[i]) {
+				return nil, false
+			}
+		}
+		if pairs, ok := tablePairsFromVar(enclosingFunctionScope(content, foreachPos), name); ok {
+			return pairs, true
+		}
+		back := foreachPos - 2000
+		if back < 0 {
+			back = 0
+		}
+		if pairs, ok := tablePairsFromVar(content[back:foreachPos], name); ok {
+			return pairs, true
+		}
+	}
+
+	return nil, false
+}
+
+// tablePairsFromVar returns the pairs of the LAST `$name = <array expression>`
+// in window.
+func tablePairsFromVar(window, name string) ([][2]string, bool) {
+	rhs, found := lastAssignmentRHS(window, name, 20000)
+	if !found {
+		return nil, false
+	}
+	return tablePairsFromExpr(rhs)
+}
+
+// tablePairsFromExpr reads an array literal, or the array argument of the call
+// that wraps one.
+func tablePairsFromExpr(expr string) ([][2]string, bool) {
+	expr = strings.TrimSpace(expr)
+	if pairs, ok := arrayLiteralPairs(expr); ok {
+		return pairs, true
+	}
+	if open := strings.IndexByte(expr, '('); open > 0 && !strings.HasPrefix(expr, "(") {
+		if args, _, ok := phpArgList(expr, open); ok {
+			for _, arg := range args {
+				if pairs, ok := arrayLiteralPairs(strings.TrimSpace(arg)); ok {
+					return pairs, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// arrayLiteralPairs parses an array literal into its (key, value) pairs. A key
+// or a value that is not a literal comes back empty, which simply means no
+// binding is available for that half.
+func arrayLiteralPairs(expr string) ([][2]string, bool) {
+	expr = strings.TrimSpace(expr)
+	var inner string
+	switch {
+	case strings.HasPrefix(expr, "["):
+		shut := matchingBracket(expr, 0)
+		if shut < 0 {
+			return nil, false
+		}
+		inner = expr[1:shut]
+	case strings.HasPrefix(expr, "array"):
+		open := skipSpace(expr, 5)
+		if open >= len(expr) || expr[open] != '(' {
+			return nil, false
+		}
+		args, _, ok := phpArgList(expr, open)
+		if !ok {
+			return nil, false
+		}
+		inner = strings.Join(args, ",")
+	default:
+		return nil, false
+	}
+
+	pairs := make([][2]string, 0, 8)
+	for _, element := range splitTopLevelArgs(inner) {
+		element = strings.TrimSpace(element)
+		if element == "" {
+			continue
+		}
+		key, value := "", ""
+		if arrow := topLevelArrow(element); arrow >= 0 {
+			key, _ = singleQuotedLiteral(strings.TrimSpace(element[:arrow]))
+			value, _ = singleQuotedLiteral(strings.TrimSpace(element[arrow+2:]))
+		} else {
+			value, _ = singleQuotedLiteral(element)
+		}
+		if key == "" && value == "" {
+			continue
+		}
+		pairs = append(pairs, [2]string{key, value})
+	}
+	if len(pairs) == 0 {
+		return nil, false
+	}
+	return pairs, true
+}
+
+// topLevelArrow returns the offset of the "=>" separating a key from a value.
+func topLevelArrow(element string) int {
+	depth := 0
+	for i := 0; i < len(element); {
+		switch element[i] {
+		case '\'', '"', '#', '/':
+			next := skipPHPNonCode(element, i)
+			if next > i {
+				i = next
+				continue
+			}
+		}
+		switch element[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case '=':
+			if depth == 0 && i+1 < len(element) && element[i+1] == '>' {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
 }
