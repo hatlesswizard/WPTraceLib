@@ -1098,12 +1098,41 @@ func EnrichEndpointsWithPluginCallGraph(endpoints []models.Endpoint, callGraph *
 	}
 }
 
+// closureSeededCalls is the callee walk for an endpoint whose callback is
+// anonymous.
+//
+// The seed is every call made by a closure in this file that was passed to a
+// WordPress registration function; from there the walk proceeds through the
+// graph exactly as it does for a named callback.
+func (cg *PluginCallGraph) closureSeededCalls(fileContent string) []string {
+	seeds := cg.registrationClosureCalls(fileContent)
+	if len(seeds) == 0 {
+		return nil
+	}
+	visited := make(map[string]bool)
+	allCalls := make([]string, 0, len(seeds))
+	for _, call := range seeds {
+		if visited[call] {
+			continue
+		}
+		visited[call] = true
+		allCalls = append(allCalls, call)
+		recurseCalls(cg, call, visited, &allCalls)
+	}
+	return allCalls
+}
+
 // GetRecursiveCallsForCallback gets all functions called by a callback recursively
 // across the entire plugin codebase
 // Memory-optimized: uses pre-computed CallsFrom map instead of re-parsing bodies
 func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent string) []string {
 	if callback == "" || callback == "unknown" || callback == "inline" || callback == "closure" {
-		return nil
+		// An anonymous callback has no name to look up, but it does have a
+		// body, and that body is in the file this endpoint was found in.
+		// Returning nil here meant that every route registered with an inline
+		// function reached nothing at all -- the endpoint was reported and
+		// everything behind it was invisible.
+		return cg.closureSeededCalls(fileContent)
 	}
 
 	// Clean up the callback name
@@ -1694,6 +1723,11 @@ func (cg *PluginCallGraph) GetReachableFiles(callback, callbackFile string) map[
 
 	callback = ResolveCallback(callback, "")
 	if callback == "" || callback == "unknown" || callback == "inline" || callback == "closure" {
+		// The caller has no file content to offer here, so an anonymous
+		// callback still contributes only its own file. followIncludes below
+		// then does what it can with that. The callee walk is where a closure's
+		// body is actually read; see closureSeededCalls.
+		cg.followIncludes(reachable)
 		return reachable
 	}
 
