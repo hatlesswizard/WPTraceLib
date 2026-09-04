@@ -437,6 +437,17 @@ func DetectAdminPages(content, filepath string, pluginSlug string) []models.Endp
 			lineNum := countLines(content[:match[0]]) + 1
 			fullMatch := content[match[0]:match[1]]
 
+			// The literal-string patterns capture the callback as ([^,)]+), which
+			// stops at the first comma -- so every PHP array callable arrives here
+			// truncated to "array( $this" or "[ $this". NormalizeCallback then has
+			// no method name to extract and answers the placeholder
+			// "this::callback", which is unusable as a call-graph key: the page is
+			// discovered and then leads nowhere. Re-read the argument with the same
+			// balanced scanner the variable-argument paths below already use.
+			if rescued := rescueTruncatedArrayCallback(content, match[0], info.Callback); rescued != "" {
+				info.Callback = rescued
+			}
+
 			// Determine auth level from capability (primary)
 			authLevel := determineAuthLevelFromCapability(info.Capability)
 
@@ -676,6 +687,38 @@ func DetectAdminPages(content, filepath string, pluginSlug string) []models.Endp
 	return endpoints
 }
 
+// rescueTruncatedArrayCallback re-reads the callback argument of an add_*_page
+// call with balanced-delimiter parsing, for the case where the caller's regex
+// capture was cut short.
+//
+// It returns "" when there is nothing to rescue, so the caller keeps whatever the
+// regex found. Only an array-form callback can be truncated this way: a PHP array
+// callable always contains a comma and the capture class ([^,)]+) ends there.
+//
+// callPos is the offset of the add_*_page identifier. Every one of these core
+// functions takes the callback as its fifth argument except add_submenu_page,
+// whose leading parent_slug pushes it to the sixth (wp-admin/includes/plugin.php).
+func rescueTruncatedArrayCallback(content string, callPos int, captured string) string {
+	captured = strings.TrimSpace(captured)
+	if !strings.HasPrefix(captured, "[") && !strings.HasPrefix(captured, "array(") &&
+		!strings.HasPrefix(captured, "array (") {
+		return ""
+	}
+	open := strings.IndexByte(content[callPos:], '(')
+	if open < 0 {
+		return ""
+	}
+	idx := 4
+	if strings.HasPrefix(content[callPos:], "add_submenu_page") {
+		idx = 5
+	}
+	args := parseBalancedArgs(content, callPos+open+1)
+	if idx >= len(args) {
+		return ""
+	}
+	return args[idx]
+}
+
 // resolveAdminArg resolves a single admin page argument
 func resolveAdminArg(arg string, st *SymbolTable, content string, position int) string {
 	arg = strings.TrimSpace(arg)
@@ -909,47 +952,158 @@ func safeExtract(content string, match []int, index int) string {
 	return content[start:end]
 }
 
-// determineAuthLevelFromCapability determines auth level from WordPress capability
+// determineAuthLevelFromCapability maps the capability declared on an admin page
+// onto the ladder.
+//
+// The exact table answers every capability WordPress core defines. Past that, the
+// pattern heuristics recognise the conventional plugin spellings (manage_*,
+// *_users, install_*, and so on) that core itself established.
+//
+// What is left is a capability nobody can name: a string the tables do not know,
+// or the "{...}" placeholder resolveAdminArg emits when the argument is a
+// variable, a constant or an array lookup it could not follow -- 704 such sites
+// in 81 of the 143 corpus plugins. The answer used to be Admin, which is a
+// privilege claim invented from no evidence, and inventing privilege is the
+// dangerous direction: a vulnerability behind an endpoint the tool calls Admin
+// looks gated and gets dismissed. What the evidence does support is that this is
+// a wp-admin screen at all, and wp-admin/admin.php calls auth_redirect() before
+// any screen renders, so every admin page needs a logged-in user. Subscriber is
+// that floor and it is the whole of what is known.
 func determineAuthLevelFromCapability(capability string) models.AuthLevel {
 	initCapabilityLevels()
 	if level, ok := capabilityLevels[capability]; ok {
 		return level
 	}
-
-	// Default to Admin for unknown admin page capabilities
-	// WordPress admin pages typically require admin access unless
-	// explicitly configured with lower capabilities
-	return models.Admin
+	if level := inferCapabilityAuthLevel(capability); level != models.Unauthenticated {
+		return level
+	}
+	return models.Subscriber
 }
 
-// analyzeAdminCallbackAuth analyzes an admin page callback function for additional auth checks
-// The callback might have stricter auth requirements than the menu capability
-// Returns the higher (more restrictive) auth level between capability and callback analysis
+// analyzeAdminCallbackAuth combines the capability WordPress enforces on an admin
+// page with whatever the page's own callback enforces on top of it.
+//
+// The declared capability is a floor, not a hint. add_submenu_page() returns
+// false without registering anything when ! current_user_can( $capability );
+// add_menu_page() attaches the callback only inside a condition that includes
+// current_user_can( $capability ); and wp-admin/admin.php refuses a hook suffix
+// missing from $_registered_pages (wp-admin/includes/plugin.php,
+// user_can_access_admin_page()). Core refuses the page before the callback runs,
+// so the callback can only add requirements to it.
+//
+// models.AuthLevel is an ascending iota enum (Unauthenticated < Subscriber <
+// Contributor < Author < Editor < Admin < SuperAdmin), so "the more restrictive
+// of the two" is an ordinal maximum. The if-chain this replaces enumerated three
+// of those seven values, so a page declaring edit_posts, publish_posts or
+// edit_others_posts matched neither test and fell through to Unauthenticated --
+// and it fell through only when the callback WAS found, which made resolving the
+// callback strictly worse than failing to. Measured over the 143-plugin corpus:
+// 78 admin pages in 17 plugins declare a contributor/author/editor capability and
+// not one of them kept its level.
+//
+// Two guards keep the max from inventing privilege of its own:
+//
+//   - The callback contributes only through StrongestGuard, not through all of
+//     InferAuthLevel. InferAuthLevel's later steps raise on an admin-shaped
+//     assertion -- is_super_admin(), is_network_admin() -- that capCheckPattern
+//     does not cover, so FindCapabilityGuards cannot classify it as gating and
+//     cannot veto it. A body whose only such call decides whether to draw a
+//     network-tools link would otherwise report Admin for a page core gates at
+//     edit_posts. is_super_admin appears in 50 of the 143 corpus plugins.
+//
+//   - The raise happens only when the callback body is unambiguously resolved.
+//     findFunctionBody takes the first "function <name>(" in the file and 174
+//     files in 57 corpus plugins declare the same name twice, so on an ambiguous
+//     name the raise could come from a guard belonging to a different class.
+//
+// SuperAdmin is deliberately held out of the combination. A declared
+// manage_network_options is one site in the whole corpus and it does not reach
+// this path today, so promoting a page six levels on the strength of one string
+// would be the largest single over-restriction available here for no measured
+// benefit. Admin is the ceiling this combination can produce; a page whose
+// capability alone says SuperAdmin still reports SuperAdmin through the early
+// returns above, which never enter the combination.
 func analyzeAdminCallbackAuth(callback string, content string, capabilityLevel models.AuthLevel) models.AuthLevel {
-	// Normalize the callback name to get the function name
 	funcName := extractFunctionNameFromCallback(callback)
 	if funcName == "" {
 		return capabilityLevel
 	}
 
-	// Find and analyze the callback function body
 	funcBody := findFunctionBody(funcName, content)
 	if funcBody == "" {
 		return capabilityLevel
 	}
-
-	// Analyze the function body for auth checks
-	callbackLevel := InferAuthLevel(funcBody)
-
-	// Return the more restrictive auth level
-	// Admin > User > Unauthenticated
-	if callbackLevel == models.Admin || capabilityLevel == models.Admin {
-		return models.Admin
+	if !uniquelyDeclaredInFile(funcName, content) {
+		return capabilityLevel
 	}
-	if callbackLevel == models.Subscriber || capabilityLevel == models.Subscriber {
+
+	level := capabilityLevel
+	if level > models.Admin {
+		level = models.Admin
+	}
+	if callbackLevel := gatingGuardLevel(funcBody); callbackLevel > level {
+		return callbackLevel
+	}
+	return level
+}
+
+// gatingGuardLevel is the privilege a function body demands of its own caller,
+// counting only checks that gate the whole body.
+//
+// This is InferAuthLevel's capability step and nothing else. The steps after that
+// one exist to salvage an answer from weaker evidence -- a capability string that
+// merely appears, an admin-shaped predicate, a login test -- and each is a channel
+// by which a decorative check inside a page callback could raise the page above
+// what WordPress enforces at the menu. When the question is "does the callback
+// demand MORE than the menu capability", only a check that stops the request can
+// answer yes.
+//
+// Among several gating checks the lowest wins, for the same reason it does in
+// InferAuthLevel: passing any one of the alternatives is enough to get in, so the
+// weakest is what an attacker needs.
+func gatingGuardLevel(body string) models.AuthLevel {
+	gatingCaps, gated := StrongestGuard(body)
+	if !gated {
+		return models.Unauthenticated
+	}
+	best := models.AuthLevel(-1)
+	for _, c := range gatingCaps {
+		lvl, ok := resolveCapabilityLevel(c)
+		if !ok {
+			continue
+		}
+		if best < 0 || lvl < best {
+			best = lvl
+		}
+	}
+	if best < 0 {
+		// Gated, but by a capability held in a variable or constant that cannot
+		// be resolved statically. Something is required; Subscriber is the floor.
 		return models.Subscriber
 	}
-	return models.Unauthenticated
+	return best
+}
+
+// uniquelyDeclaredInFile reports whether exactly one function or method in this
+// file is called funcName, which is the condition under which findFunctionBody's
+// answer is certainly the right body.
+//
+// FindFunctionDeclarations is the balanced-paren scan the call graph uses, so it
+// sees declarations that findFunctionBody's plain "function <name>" search would
+// spell differently. Counting with the more generous scanner makes the "ambiguous"
+// verdict more likely, which is the safe direction here: ambiguity only suppresses
+// a raise.
+func uniquelyDeclaredInFile(funcName, content string) bool {
+	seen := 0
+	for _, d := range FindFunctionDeclarations(content) {
+		if d.Name == funcName {
+			seen++
+			if seen > 1 {
+				return false
+			}
+		}
+	}
+	return seen == 1
 }
 
 // extractFunctionNameFromCallback extracts the function name from various callback formats
