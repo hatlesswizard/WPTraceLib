@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -216,6 +217,13 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 	directEndpoints := DetectDirectPHPEndpointsWithAST(pluginDir, pluginSlug, astCtx)
 	analysis.Endpoints = append(analysis.Endpoints, directEndpoints...)
 
+	// PASS 3.44: A register_rest_route written in a base class is one live
+	// registration per concrete subclass, and only the base's copy was emitted.
+	if len(analysis.Endpoints) > 0 {
+		analysis.Endpoints = append(analysis.Endpoints,
+			expandInheritedRESTEndpoints(analysis.Endpoints, astCtx, strippedContentCache, pluginDir)...)
+	}
+
 	// PASS 3.45: Entry points driven by code outside the tree.
 	//
 	// This one is plugin-wide rather than per-file, because deciding that
@@ -302,6 +310,256 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 	a.extractPluginMetadata(pluginDir, analysis)
 
 	return analysis, nil
+}
+
+// restRoutePlaceholderPattern matches the {property} markers cleanRouteString
+// leaves behind when a route is built from $this->rest_base or $this->namespace.
+var restRoutePlaceholderPattern = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+
+// restThisCallbackPattern matches the array( $this, 'method' ) callbacks a
+// register_rest_route call names, in any of its arms.
+var restThisCallbackPattern = regexp.MustCompile(`(?:\[|array\s*\()\s*\$this\s*,\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]`)
+
+// expandInheritedRESTEndpoints adds, for a register_rest_route written in a base
+// class, the endpoints its subclasses register.
+//
+// PHP resolves $this->update_item() and reads $this->rest_base on the runtime
+// object, and a class that does not redeclare register_routes() inherits its
+// parent's verbatim. WordPress calls register_routes() once per controller it
+// instantiates. So one textual register_rest_route in an abstract base is N live
+// registrations with N route strings and, wherever a subclass overrides, N
+// different method bodies -- and the analyzer, being a per-file text scan with
+// no notion of subclasses, reported exactly one, attributed to the base. Every
+// overriding subclass was then reachable from no endpoint at all: 46 classes
+// across 8 of 143 trees inherit register_routes() without declaring it.
+//
+// Clones are added, never substituted. The base's own record stays, because the
+// base may be instantiated through a concrete leaf the hierarchy missed.
+//
+// Only subclasses that genuinely register something different are cloned:
+//
+//   - the subclass overrides the handler this endpoint names, or
+//   - it overrides one of the other methods the registration names -- its
+//     permission callback, most importantly, and
+//   - it gives one of the route's {property} placeholders a value of its own.
+//
+// A subclass that overrides none of those registers a route this endpoint
+// already describes, and cloning it would add a record with the same route, the
+// same gate and a body that is literally the base's. That bound matters: a base
+// class in the corpus has as many as 31 transitive descendants in a tree with 85
+// register_rest_route calls, and clone-per-descendant is a four-figure endpoint
+// count in one plugin, each clone paying its own graph walks.
+//
+// A clone's callback carries the subclass's name so that it survives beside the
+// base's record -- the merge keys on the callback -- and so that the walk starts
+// from the subclass's own file. Consumers that match on a bare method name are
+// unaffected: they strip everything before "::".
+func expandInheritedRESTEndpoints(endpoints []models.Endpoint, astCtx *wpast.ASTContext,
+	fileContents map[string]string, pluginDir string) []models.Endpoint {
+
+	if astCtx == nil || !astCtx.Available || astCtx.Resolver == nil || astCtx.Resolver.SymTable == nil {
+		return nil
+	}
+
+	// Classes by file, so an endpoint's line can be attributed to the class
+	// whose body encloses it.
+	byFile := make(map[string][]*wpast.ClassSymbol, len(astCtx.Resolver.SymTable.Classes))
+	for _, cls := range astCtx.Resolver.SymTable.Classes {
+		byFile[cls.File] = append(byFile[cls.File], cls)
+	}
+
+	var clones []models.Endpoint
+	for _, ep := range endpoints {
+		if ep.Type != models.EndpointTypeREST {
+			continue
+		}
+		method, ok := thisCallbackMethod(ep.Callback)
+		if !ok {
+			continue
+		}
+		absFile := filepath.Join(pluginDir, ep.File)
+		owner := enclosingClass(byFile[absFile], ep.Line)
+		if owner == nil {
+			continue
+		}
+		subclasses := astCtx.Resolver.GetSubclasses(owner.FQN)
+		if len(subclasses) == 0 {
+			continue
+		}
+
+		named := registrationCallbackNames(fileContents[absFile], ep.Line, ep.RawCode)
+		placeholders := restRoutePlaceholderPattern.FindAllStringSubmatch(ep.Route, -1)
+
+		for _, subFQN := range subclasses {
+			sub := astCtx.Resolver.SymTable.Classes[subFQN]
+			if sub == nil {
+				continue
+			}
+
+			route, routeDiffers := substituteRouteProperties(ep.Route, placeholders, owner.FQN, subFQN, astCtx.Resolver)
+
+			overridden := make([]string, 0, 2)
+			if _, ok := sub.Methods[method]; ok {
+				overridden = append(overridden, method)
+			}
+			for _, n := range named {
+				if n == method {
+					continue
+				}
+				if _, ok := sub.Methods[n]; ok {
+					overridden = append(overridden, n)
+				}
+			}
+			if len(overridden) == 0 && !routeDiffers {
+				continue
+			}
+
+			// The level. Copying the base's is right only when the subclass
+			// leaves the registration's gates alone; when it overrides one, the
+			// gate that runs is the subclass's, and a level read off the base
+			// would be a privilege this code has not been shown to require. So
+			// each override is re-read against the subclass and the weakest
+			// answer wins -- which also means an unreadable override answers
+			// unauthenticated rather than inheriting a restriction.
+			level := ep.AuthLevel
+			for _, n := range overridden {
+				resolved := astCtx.Resolver.ResolvePermissionCallback(wpast.CallbackRef{
+					Type:       "static_method",
+					ClassName:  subFQN,
+					MethodName: n,
+					File:       sub.File,
+				})
+				if resolved < level {
+					level = resolved
+				}
+			}
+
+			relFile, err := makeRelativePath(sub.File, pluginDir)
+			if err != nil {
+				relFile = ep.File
+			}
+			clones = append(clones, models.Endpoint{
+				PluginSlug: ep.PluginSlug,
+				Type:       ep.Type,
+				Route:      route,
+				Method:     ep.Method,
+				AuthLevel:  level,
+				Callback:   shortClassName(subFQN) + "::" + method,
+				File:       relFile,
+				Line:       sub.Line,
+				RawCode:    ep.RawCode,
+				Namespace:  ep.Namespace,
+			})
+		}
+	}
+	return clones
+}
+
+// thisCallbackMethod reports the method an endpoint callback names when it is
+// written against the current object, which is the shape a base class's
+// registration always has.
+func thisCallbackMethod(callback string) (string, bool) {
+	for _, prefix := range []string{"this::", "self::", "static::"} {
+		if strings.HasPrefix(callback, prefix) {
+			name := strings.TrimPrefix(callback, prefix)
+			if name != "" && !strings.ContainsAny(name, "$()[]") {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// enclosingClass returns the class whose declaration most closely precedes line.
+func enclosingClass(classes []*wpast.ClassSymbol, line int) *wpast.ClassSymbol {
+	var best *wpast.ClassSymbol
+	for _, cls := range classes {
+		if cls.Line > line {
+			continue
+		}
+		if best == nil || cls.Line > best.Line {
+			best = cls
+		}
+	}
+	return best
+}
+
+// registrationCallbackNames lists the methods a register_rest_route call names
+// as array( $this, '...' ) -- handlers and permission callbacks alike.
+//
+// The call is re-read from the file rather than from Endpoint.RawCode, which is
+// truncated: a multi-arm registration loses its later arms there, and the later
+// arms are where the writing gates live.
+func registrationCallbackNames(content string, line int, rawCode string) []string {
+	src := rawCode
+	if content != "" {
+		if start := offsetOfLine(content, line); start >= 0 {
+			if idx := strings.Index(content[start:], "register_rest_route"); idx >= 0 {
+				open := strings.Index(content[start+idx:], "(")
+				if open >= 0 {
+					if block := extractParenBlock(content, start+idx+open); block != "" {
+						src = block
+					}
+				}
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range restThisCallbackPattern.FindAllStringSubmatch(src, -1) {
+		if seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// offsetOfLine returns the byte offset where the 1-based line begins.
+func offsetOfLine(content string, line int) int {
+	if line <= 1 {
+		return 0
+	}
+	offset := 0
+	for n := 1; n < line; n++ {
+		i := strings.IndexByte(content[offset:], '\n')
+		if i < 0 {
+			return -1
+		}
+		offset += i + 1
+	}
+	return offset
+}
+
+// substituteRouteProperties fills a route's {property} markers with the
+// subclass's own values, and reports whether any of them differs from the
+// base's -- which is by itself a different registration.
+func substituteRouteProperties(route string, placeholders [][]string, baseFQN, subFQN string,
+	resolver *wpast.Resolver) (string, bool) {
+
+	differs := false
+	for _, ph := range placeholders {
+		subValue, ok := resolver.ResolveProperty(subFQN, ph[1])
+		if !ok || subValue == "" {
+			continue
+		}
+		baseValue, _ := resolver.ResolveProperty(baseFQN, ph[1])
+		if subValue != baseValue {
+			differs = true
+		}
+		route = strings.Replace(route, ph[0], subValue, 1)
+	}
+	return route, differs
+}
+
+// shortClassName drops the namespace from a fully qualified name, matching the
+// key the call graph stores a method under.
+func shortClassName(fqn string) string {
+	if i := strings.LastIndex(fqn, `\`); i >= 0 {
+		return fqn[i+1:]
+	}
+	return fqn
 }
 
 // relativeContentIndex re-keys the stripped-content cache by plugin-relative
