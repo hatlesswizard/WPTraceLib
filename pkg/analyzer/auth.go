@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -42,75 +43,45 @@ var (
 
 	// Patterns for isExplicitlyBlocked - endpoints with __return_false or similar
 	// These endpoints are BLOCKED and should not be included in analysis
-	blockedPermissionCallbackFalsePattern   = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*['"]__return_false['"]`)
-	blockedPermissionCallbackBoolPattern    = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*false\b`)
-	blockedPermissionCallbackInlinePattern  = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*function\s*\([^)]*\)\s*\{\s*return\s+false\s*;\s*\}`)
+	blockedPermissionCallbackFalsePattern  = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*['"]__return_false['"]`)
+	blockedPermissionCallbackBoolPattern   = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*false\b`)
+	blockedPermissionCallbackInlinePattern = regexp.MustCompile(`['"]permission_callback['"]\s*=>\s*function\s*\([^)]*\)\s*\{\s*return\s+false\s*;\s*\}`)
 
-	// Patterns for extractCapabilityCheck
-	capabilityCurrentUserCanPattern    = regexp.MustCompile(`current_user_can\s*\(\s*['"]([a-z_]+)['"]\s*\)`)
-	capabilityCurrentUserCanAltPattern = regexp.MustCompile(`current_user_can\s*\(\s*['"]([a-z_]+)['"]`)
-	// Pattern for user_can($user, 'capability') - WordPress function with explicit user ID
-	// Example: user_can( $current_user, 'manage_options' ), user_can( $user_id, 'edit_posts' )
-	capabilityUserCanPattern = regexp.MustCompile(`user_can\s*\([^,]+,\s*['"]([a-z_]+)['"]`)
-	capabilityKeyPattern     = regexp.MustCompile(`['"]capability['"]\s*=>\s*['"]([a-z_]+)['"]`)
-	capabilityCapKeyPattern            = regexp.MustCompile(`['"]cap['"]\s*=>\s*['"]([a-z_]+)['"]`)
-	// Pattern for filtered capabilities: current_user_can(apply_filters('filter_name', 'default_cap'))
-	// This captures the DEFAULT capability which is the second argument to apply_filters
-	capabilityApplyFiltersPattern = regexp.MustCompile(`current_user_can\s*\(\s*apply_filters\s*\(\s*['"][^'"]+['"]\s*,\s*['"]([a-z_]+)['"]`)
-
-	// Patterns for admin capability checks - WordPress CORE only
-	// IMPORTANT: is_admin() is NOT an auth check - it checks LOCATION (admin panel), not privileges!
-	// An unauthenticated user visiting /wp-admin/ will have is_admin() === true
-	// DO NOT use adminIsAdminPattern for auth level determination!
-	adminIsAdminPattern        = regexp.MustCompile(`is_admin\s*\(\s*\)`) // LOCATION CHECK ONLY
-	adminIsSuperAdminPattern   = regexp.MustCompile(`is_super_admin\s*\(\s*\)`)
-	adminIsNetworkAdminPattern = regexp.MustCompile(`is_network_admin\s*\(\s*\)`)
-	adminManageOptionsPattern  = regexp.MustCompile(`current_user_can\s*\(\s*['"]manage_options['"]`)
-	adminAdministratorPattern  = regexp.MustCompile(`current_user_can\s*\(\s*['"]administrator['"]`)
-
-	// Role-based admin check patterns
+	// Role-based admin check pattern, consumed by guard.go's check table.
 	// Matches: in_array('administrator', $user->roles)
 	// Matches: in_array('administrator', $current_user->roles)
 	// Matches: in_array('administrator', $user->roles, true)
+	//
+	// WP_User::$roles is populated by core from the site's role map, so this is
+	// a membership test in core's own vocabulary rather than a guess from a name.
 	adminRoleInArrayPattern = regexp.MustCompile(`in_array\s*\(\s*['"]administrator['"]\s*,\s*\$[a-zA-Z_][a-zA-Z0-9_]*->roles`)
 
-	// Generic admin capability check patterns (not plugin-specific)
-	// These are common patterns used across many plugins
-	genericAdminCanManagePattern      = regexp.MustCompile(`(?:can_manage|canManage)\s*\(\s*\)`)
-	genericAdminIsAdminUserPattern    = regexp.MustCompile(`(?:is_admin_user|isAdminUser)\s*\(\s*\)`)
-	genericAdminVerifyCapPattern      = regexp.MustCompile(`verify_(?:admin_)?capability|verifyAdminCapability`)
-	genericAdminCheckPermissionPattern = regexp.MustCompile(`check(?:_)?(?:admin)?(?:_)?permission[s]?\s*\(\s*\)`)
-	// Static class admin check patterns - common across many plugins
-	// Matches: ClassName::isAdmin(), Helper::is_admin(), wfUtils::isAdmin()
-	// This pattern is universal - many plugins wrap admin checks in static methods
-	genericStaticAdminCheckPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*::(?:is[_]?[Aa]dmin|has_admin_capability|check_admin|checkAdmin|isAdministrator)\s*\(\s*\)`)
-	// NOTE: check_admin_referer() is NOT an admin auth check!
-	// It's just a nonce verification function - a logged-in Subscriber can pass it.
-	// We intentionally do NOT use this for admin auth detection.
+	// NOTE: check_admin_referer(), check_ajax_referer() and wp_verify_nonce()
+	// are deliberately absent from this file. wp_create_nonce($action) is
+	// wp_hash($tick . '|' . $action . '|' . $uid . '|' . $token), and
+	// get_current_user_id() is 0 for every anonymous visitor, so the nonce
+	// minted for an action a plugin has declared reachable by uid 0 is the same
+	// for all of them and is published in page output by wp_localize_script or
+	// wp_nonce_field. A nonce is CSRF provenance; it establishes nothing at all
+	// about the caller's role. Two clauses that read Subscriber out of one have
+	// been removed from the delegation walk below.
 
-	// Patterns for hasUserCheck
-	userIsUserLoggedInPattern   = regexp.MustCompile(`is_user_logged_in\s*\(\s*\)`)
-	userWpGetCurrentUserPattern = regexp.MustCompile(`wp_get_current_user\s*\(\s*\)`)
-	userGetCurrentUserIdPattern = regexp.MustCompile(`get_current_user_id\s*\(\s*\)`)
-	// auth_redirect() - Forces login, redirects non-logged-in users to login page
-	userAuthRedirectPattern = regexp.MustCompile(`auth_redirect\s*\(\s*\)`)
-	userCurrentUserCanPattern   = regexp.MustCompile(`current_user_can\s*\(`)
+	// NOTE: is_admin() is absent for a different reason. It reports LOCATION --
+	// that the request is being served from wp-admin, which includes every
+	// admin-ajax.php request, wp_ajax_nopriv_ ones among them -- and core
+	// documents it as unsuitable for validating secured requests.
 
-	// User/Role object has_cap patterns - common auth check pattern
-	// Matches: $user->has_cap('capability'), $current_user->has_cap('manage_options')
-	// Matches: $role->has_cap('edit_posts'), $roleObject->has_cap('administrator')
-	// IMPORTANT: $wpdb->has_cap() is database capability, NOT auth - excluded by var name
-	userObjectHasCapPattern = regexp.MustCompile(`\$(?:user|current_user|role|roleObject|this->user)\s*->\s*has_cap\s*\(\s*['"]([^'"]+)['"]`)
-
-	// Static helper has_cap patterns - wraps current_user_can in many plugins
-	// Matches: Helper::has_cap('capability'), SomeClass::has_cap('something')
-	// This is a general pattern used by Rank Math, and other plugins
-	staticHelperHasCapPattern = regexp.MustCompile(`[A-Z][a-zA-Z0-9_]*::\s*has_cap\s*\(\s*['"]([^'"]+)['"]`)
-
-	// Patterns for hasNonceCheck
-	nonceWpVerifyPattern  = regexp.MustCompile(`wp_verify_nonce\s*\(`)
-	nonceCheckAjaxPattern = regexp.MustCompile(`check_ajax_referer\s*\(`)
-	nonceCheckAdminPattern = regexp.MustCompile(`check_admin_referer\s*\(`)
+	// NOTE: the five "generic admin" patterns that used to live here are gone:
+	// can_manage()/canManage(), is_admin_user()/isAdminUser(),
+	// verify_capability, check_permission()/checkPermissions(), and
+	// ClassName::isAdmin(). Each read Admin out of an identifier's spelling.
+	// WordPress attaches no meaning to a PHP function's name, and the spelling
+	// can be wrong in both halves at once: a measured Postman\PostmanUtils
+	// ::isAdmin() is `current_user_can( SOME_CONSTANT ) && is_admin()`, whose
+	// own docblock quotes core saying is_admin() "is not suitable for
+	// validating secured requests". This repository had already measured and
+	// removed one rule of this class -- see TestAjaxNameDoesNotPromoteToAdmin,
+	// where ~50 English verbs promoted 818 of 3478 logged-in AJAX endpoints.
 
 	// Pattern for hasPermissionCallback
 	permissionCallbackExistsPattern = regexp.MustCompile(`['"]permission_callback['"]`)
@@ -132,37 +103,13 @@ var (
 			`(?:\$this(?:->(?:[a-zA-Z_][a-zA-Z0-9_]*))*->([a-zA-Z_][a-zA-Z0-9_]*)\s*\(|` + // $this->method($request) - captures method name
 			`([^,\]]+))`, // fallback: capture whole expression
 	)
-	// Pattern to find current_user_can in permission callback context
-	permCallbackCapabilityPattern = regexp.MustCompile(`current_user_can\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]`)
-	// Pattern to find user_can($user, 'capability') - WordPress function with explicit user ID
-	// The capability is the SECOND argument
-	// Example: user_can( $current_user, 'manage_options' )
-	permCallbackUserCanPattern = regexp.MustCompile(`user_can\s*\([^,]+,\s*['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]`)
-
-	// Pattern to detect method delegation in inline permission callbacks
-	// Matches: return $this->get_permission_callback($request)
-	// Matches: return $this->controller->get_permission_callback($request)
-	// This is a common pattern in WordPress REST controllers where the inline function
-	// delegates to a method that contains the actual capability check
-	permCallbackMethodDelegationPattern = regexp.MustCompile(
-		`return\s+\$this(?:->(?:[a-zA-Z_][a-zA-Z0-9_]*))*->([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`,
-	)
-
-	// Pattern to detect STATIC method delegation in inline permission callbacks
-	// Matches: return ClassName::method_name($arg)
-	// Matches: return Two_Factor_Core::rest_api_can_edit_user_and_update_two_factor_options($request['user_id'])
-	// This is common in WordPress plugins where permission checks are centralized in a core class
-	permCallbackStaticDelegationPattern = regexp.MustCompile(
-		`return\s+([A-Za-z_][A-Za-z0-9_\\]*)::([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`,
-	)
-
-	// Pattern to detect function call delegation in inline permission callbacks
-	// Matches: return some_permission_function($args)
-	// Matches: return can_do_something()
-	// This handles standalone function calls (not method calls)
-	permCallbackFunctionDelegationPattern = regexp.MustCompile(
-		`return\s+([a-z_][a-zA-Z0-9_]*)\s*\(`,
-	)
+	// NOTE: five patterns that used to sit here are gone with the code that
+	// consumed them: two that scraped the first current_user_can/user_can literal
+	// out of a callback body regardless of whether it gated anything, and three
+	// that recognised `return $this->m()`, `return C::m()` and `return m()` so a
+	// name could be guessed from. Delegation is now followed through the call
+	// graph in delegatedAuthLevel, which asks whether the call gates rather than
+	// what it is called.
 
 	// Pattern for NormalizeCallback
 	normalizeCallbackArrayPattern = regexp.MustCompile(`(?:\[|\barray\s*\()\s*\$?([^,]+),\s*['"]([^'"]+)['"]\s*(?:\]|\))`)
@@ -306,104 +253,174 @@ func parseStringToAuthLevel(level string) models.AuthLevel {
 	}
 }
 
-// InferAuthLevel analyzes code to determine the required authentication level.
-// Uses the 6-level WordPress role hierarchy:
-// SuperAdmin > Admin > Editor > Author > Contributor > Subscriber > Unauthenticated
+// InferAuthLevel reports the authentication level the code it is handed
+// requires, from the checks that GATE that code.
+//
+// The rule is a single one: a level comes from a check that stops the request
+// when it fails, and from nothing else. What used to sit beside that rule read a
+// level out of the mere PRESENCE of something --
+//
+//	is_super_admin() anywhere in the blob                    -> Admin
+//	a method spelled Foo::isAdmin() or check_permission()    -> Admin
+//	is_user_logged_in() anywhere, decorative or not          -> Subscriber
+//	the string "permission_callback" anywhere                -> Subscriber
+//	a capability literal anywhere, in an array or a comment  -> that level
+//
+// -- and every one of those made a reachable, unguarded sink read as gated,
+// which is the error direction that hides a vulnerability rather than merely
+// adding noise. Measured: `{ if ( is_super_admin() ) { $extra = 1; }
+// update_option( 'o', $_POST['v'] ); }` reported Admin with no gating guard
+// anywhere in it.
+//
+// Worse, the qualifier meant to hold those rules back read backwards. Step 3
+// was gated on !hasOnlyNonGatingCapabilityChecks(code), and that helper
+// returned FALSE when the guard analysis found nothing at all -- so the
+// qualifier passed exactly when the admin signal was one guard.go could not
+// see, which is every signal those rules matched.
+//
+// The predicates that genuinely say something about the caller
+// (is_user_logged_in, is_super_admin, auth_redirect, get_current_user_id,
+// in_array('administrator', $u->roles)) now go through the same control-flow
+// classifier current_user_can goes through, because PHP does not care which
+// function produced the boolean. They count when they gate and not when they
+// decorate.
 //
 // Priority order:
-// 1. Explicit unauthenticated patterns (highest priority - definite public access)
-// 2. Capability checks (specific permission requirements mapped to appropriate level)
-// 3. Admin-specific capability patterns (NOT is_admin() - that's location check)
-// 4. User login checks (is_user_logged_in, etc.) -> Subscriber (lowest auth level)
-// 5. Permission callback exists but unanalyzed -> Subscriber (conservative default)
-// 6. Nonce verification ALONE does NOT determine auth level (CSRF protection only)
-// 7. Default: Unauthenticated (no auth checks found)
+//  1. Explicit unauthenticated markers -- wp_ajax_nopriv_, permission_callback
+//     => __return_true -- the plugin itself saying the endpoint is public.
+//  2. The checks that gate. Among several capability gates the LOWEST wins:
+//     passing any one of them is enough to get in, so the weakest is what an
+//     attacker needs. A login-level gate is a floor and is consulted only when
+//     no capability gate was found, so a defensive `if ( ! is_user_logged_in() )
+//     { wp_die(); }` cannot pull a resolved manage_options gate down to
+//     Subscriber the way a flat minimum over both pools would.
+//  3. Admin patterns the operator configured, if any.
+//  4. Default: Unauthenticated.
 func InferAuthLevel(code string) models.AuthLevel {
+	return InferAuthLevelInFile(code, "")
+}
+
+// InferAuthLevelInFile is InferAuthLevel with the enclosing file available, so
+// that a capability held in a class constant or a property can be resolved to
+// the literal it holds. PHP evaluates current_user_can()'s argument before the
+// call, so `private $capability = 'edit_posts'; ... current_user_can(
+// $this->capability )` asks exactly what writing the literal inline would ask.
+func InferAuthLevelInFile(code string, fileContent string) models.AuthLevel {
+	return inferAuthLevel(code, fileContent, ScopeRequest)
+}
+
+// InferAuthLevelInScope is InferAuthLevel for a body that is not what WordPress
+// dispatched. In a helper a `return` ends the helper and nothing else, so a
+// check whose only consequence is a return does not gate the helper's caller.
+func InferAuthLevelInScope(code string, fileContent string, scope BodyScope) models.AuthLevel {
+	return inferAuthLevel(code, fileContent, scope)
+}
+
+func inferAuthLevel(code string, fileContent string, scope BodyScope) models.AuthLevel {
 	// Ensure capability levels are initialized from configuration
 	initCapabilityLevels()
 
-	// 1. Check for explicit unauthenticated patterns (highest priority)
 	if isExplicitlyUnauthenticated(code) {
 		return models.Unauthenticated
 	}
 
-	// 2. Capability checks -- but only the ones that actually gate this code.
-	//
-	// A capability check that appears in the body is not the same as one that
-	// protects it. A handler with an admin-only branch beside an unguarded
-	// vulnerable branch used to report Admin, which is the dangerous direction
-	// of error: a reachable vulnerability looked gated. FindCapabilityGuards
-	// distinguishes "fail the check and the request stops" from "the check
-	// decides one branch" and from "the result is assigned to a variable".
-	//
-	// When several checks each gate the whole body, the LOWEST wins: passing
-	// any one of them is enough to get in, so the weakest is what an attacker
-	// needs.
-	if gatingCaps, gated := StrongestGuard(code); gated {
-		best := models.AuthLevel(-1)
-		for _, c := range gatingCaps {
-			lvl, ok := resolveCapabilityLevel(c)
-			if !ok {
-				continue
-			}
-			if best < 0 || lvl < best {
-				best = lvl
+	if level, ok := gatedAuthLevel(code, fileContent, scope); ok {
+		return level
+	}
+
+	// An operator analysing a codebase they know can name their own admin
+	// wrappers here. This is the one presence-based rule left in the file; it is
+	// empty by default, and it is opt-in precisely because presence is not
+	// authorization.
+	if authConfig != nil && authConfig.AdminPatterns != nil {
+		for _, pattern := range authConfig.AdminPatterns.CustomPatterns {
+			if re, err := regexp.Compile(pattern); err == nil && re.MatchString(code) {
+				return models.Admin
 			}
 		}
-		if best >= 0 {
-			return best
-		}
-		// The body is gated, but by a capability held in a variable or constant
-		// that cannot be resolved statically. Something is required; Subscriber
-		// is the floor for "a logged-in user at minimum".
-		return models.Subscriber
 	}
 
-	capability := extractCapabilityCheck(code)
-	if capability != "" && !hasOnlyNonGatingCapabilityChecks(code) {
-		// Use configuration-based lookup
-		if level, ok := getCapabilityLevel(capability); ok {
-			return level
-		}
-		// Fallback to hardcoded map for backwards compatibility
-		if level, ok := capabilityLevels[capability]; ok {
-			return level
-		}
-		// Apply pattern-based heuristics for unknown capabilities
-		// This handles dynamically-generated capabilities
-		if inferredLevel := inferCapabilityAuthLevel(capability); inferredLevel != models.Unauthenticated {
-			return inferredLevel
-		}
-		// Unknown capability with no pattern match - assume Subscriber (requires login)
-		return models.Subscriber
-	}
-
-	// 3. Admin-shaped assertions, subject to the same gating test. Without it a
-	// plugin that merely mentions manage_options in an unguarded branch reads
-	// as Admin.
-	if hasAdminCapabilityCheck(code) && !hasOnlyNonGatingCapabilityChecks(code) {
-		return models.Admin
-	}
-
-	// 4. Check for is_user_logged_in() or similar explicit login checks
-	// This indicates ANY logged-in user is required -> Subscriber level
-	if hasUserLoginCheck(code) {
-		return models.Subscriber
-	}
-
-	// 5. If permission_callback exists but we couldn't analyze it, assume Subscriber
-	// This is conservative - better to assume auth required than not
-	if hasPermissionCallback(code) {
-		return models.Subscriber
-	}
-
-	// 6. IMPORTANT: Nonce verification (wp_verify_nonce, check_ajax_referer, etc.)
-	// does NOT determine auth level by itself. Nonces are CSRF protection, not auth.
-	// A public form can have a nonce without requiring login.
-	// We do NOT check hasNonceCheck() here anymore.
-
-	// 7. No auth checks found - endpoint is unauthenticated
+	// Nonce verification is deliberately not consulted. Nonces are CSRF
+	// protection, not authentication: a public form can carry one.
 	return models.Unauthenticated
+}
+
+// gatedAuthLevel resolves the checks that gate a body into the level a caller
+// needs in order to get past them.
+func gatedAuthLevel(code string, fileContent string, scope BodyScope) (models.AuthLevel, bool) {
+	guards, selfContained := analyseGuards(code, scope)
+	if !selfContained {
+		// The blob holds whole function declarations, so the checks inside it
+		// gate those functions and say nothing about the blob. Answering from
+		// them would attribute one function's guard to code it never protected
+		// -- and would make the answer depend on how wide a slice the caller
+		// happened to take.
+		return 0, false
+	}
+
+	capBest := models.AuthLevel(-1)
+	capGated := false
+	loginBest := models.AuthLevel(-1)
+
+	for _, g := range guards {
+		if g.Kind != GuardFunction {
+			continue
+		}
+		if g.IsIdentity {
+			if loginBest < 0 || g.Implied < loginBest {
+				loginBest = g.Implied
+			}
+			continue
+		}
+		capGated = true
+		if lvl, ok := capabilityGuardLevel(g, code, fileContent); ok {
+			if capBest < 0 || lvl < capBest {
+				capBest = lvl
+			}
+		}
+	}
+
+	if capGated {
+		if capBest >= 0 {
+			return capBest, true
+		}
+		// Gated, but by a capability held in a symbol that nothing in reach
+		// resolves. Something is required; Subscriber is the floor, because
+		// current_user_can() on a logged-out WP_User(0) is false for every
+		// capability except 'exist'.
+		return models.Subscriber, true
+	}
+	if loginBest >= 0 {
+		return loginBest, true
+	}
+	return 0, false
+}
+
+// capabilityGuardLevel resolves one capability gate, following a symbol to the
+// literal it holds when the code in reach makes that unambiguous.
+func capabilityGuardLevel(g CapabilityGuard, body string, fileContent string) (models.AuthLevel, bool) {
+	if g.Capability != "" {
+		return resolveCapabilityForSubject(g.Capability, g.HasSubjectArg)
+	}
+	if g.CapabilityExpr == "" {
+		return 0, false
+	}
+	best := models.AuthLevel(-1)
+	for _, lit := range symbolLiterals(g.CapabilityExpr, body, fileContent) {
+		lvl, ok := resolveCapabilityForSubject(lit, g.HasSubjectArg)
+		if !ok {
+			continue
+		}
+		// Several candidate literals mean several ways in, and the cheapest is
+		// what an attacker needs.
+		if best < 0 || lvl < best {
+			best = lvl
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // isExplicitlyUnauthenticated checks for patterns that indicate public access
@@ -423,692 +440,153 @@ func IsExplicitlyBlocked(code string) bool {
 		blockedPermissionCallbackInlinePattern.MatchString(code)
 }
 
-// extractCapabilityCheck extracts the capability being checked
-func extractCapabilityCheck(code string) string {
-	// Use pre-compiled package-level patterns
-	capabilityPatterns := []*regexp.Regexp{
-		capabilityCurrentUserCanPattern,
-		capabilityCurrentUserCanAltPattern,
-		// user_can($user, 'capability') - WordPress function with explicit user ID
-		capabilityUserCanPattern,
-		capabilityKeyPattern,
-		capabilityCapKeyPattern,
-		// Pattern for filtered capabilities: current_user_can(apply_filters('filter', 'cap'))
-		capabilityApplyFiltersPattern,
-		// User/Role object has_cap patterns: $user->has_cap('capability')
-		userObjectHasCapPattern,
-		// Static helper has_cap patterns: Helper::has_cap('capability')
-		staticHelperHasCapPattern,
-	}
-
-	for _, re := range capabilityPatterns {
-		matches := re.FindStringSubmatch(code)
-		if len(matches) >= 2 {
-			return matches[1]
-		}
-	}
-
-	return ""
-}
-
-// hasAdminCapabilityCheck checks for admin-level CAPABILITY checks only
-// IMPORTANT: is_admin() is NOT included here - it checks admin panel LOCATION, not auth level
-// An unauthenticated user viewing /wp-admin/ will have is_admin() return true
-func hasAdminCapabilityCheck(code string) bool {
-	// ============================================
-	// WORDPRESS CORE PATTERNS (always active)
-	// ============================================
-
-	// is_super_admin() - checks if user is a super admin (multisite)
-	if adminIsSuperAdminPattern.MatchString(code) {
-		return true
-	}
-	// is_network_admin() in combination with capability check
-	// Note: is_network_admin() alone just checks if in network admin area
-	if adminIsNetworkAdminPattern.MatchString(code) && adminManageOptionsPattern.MatchString(code) {
-		return true
-	}
-	// current_user_can('manage_options') - admin capability
-	if adminManageOptionsPattern.MatchString(code) {
-		return true
-	}
-	// current_user_can('administrator') - admin role check
-	if adminAdministratorPattern.MatchString(code) {
-		return true
-	}
-	// in_array('administrator', $user->roles) - role-based admin check
-	// Common pattern across many plugins
-	if adminRoleInArrayPattern.MatchString(code) {
-		return true
-	}
-	// NOTE: check_admin_referer() is intentionally NOT checked here.
-	// It's a nonce verification, not an admin privilege check.
-	// A logged-in Subscriber can pass check_admin_referer() with the right nonce.
-
-	// ============================================
-	// GENERIC PATTERNS (always active)
-	// These are common patterns used across many plugins
-	// ============================================
-
-	// Generic admin capability check wrappers: can_manage(), canManage()
-	if genericAdminCanManagePattern.MatchString(code) {
-		return true
-	}
-	// is_admin_user(), isAdminUser()
-	if genericAdminIsAdminUserPattern.MatchString(code) {
-		return true
-	}
-	// verify_admin_capability / verifyAdminCapability
-	if genericAdminVerifyCapPattern.MatchString(code) {
-		return true
-	}
-	// Generic check_permission/checkPermission patterns
-	if genericAdminCheckPermissionPattern.MatchString(code) {
-		return true
-	}
-	// Static class admin check patterns: ClassName::isAdmin(), Helper::is_admin()
-	// Universal pattern used across many plugins (Wordfence, etc.)
-	if genericStaticAdminCheckPattern.MatchString(code) {
-		return true
-	}
-
-	// ============================================
-	// CONFIGURABLE CUSTOM PATTERNS (from configuration)
-	// Users can add their own patterns via config
-	// ============================================
-
-	if authConfig != nil && authConfig.AdminPatterns != nil {
-		// Custom patterns from configuration
-		if len(authConfig.AdminPatterns.CustomPatterns) > 0 {
-			for _, pattern := range authConfig.AdminPatterns.CustomPatterns {
-				if re, err := regexp.Compile(pattern); err == nil {
-					if re.MatchString(code) {
-						return true
-					}
-				}
-			}
-		}
-	}
-
-	return false
-}
-
-// hasAdminCheck is DEPRECATED - kept for backwards compatibility
-// Use hasAdminCapabilityCheck instead which doesn't include is_admin()
-func hasAdminCheck(code string) bool {
-	// NOTE: is_admin() removed - it checks location, not authentication
-	return adminIsSuperAdminPattern.MatchString(code) ||
-		adminIsNetworkAdminPattern.MatchString(code) ||
-		adminManageOptionsPattern.MatchString(code) ||
-		adminAdministratorPattern.MatchString(code) ||
-		adminRoleInArrayPattern.MatchString(code)
-}
-
-// hasUserLoginCheck checks for explicit user login requirements
-// These patterns directly indicate that a logged-in user is required
-func hasUserLoginCheck(code string) bool {
-	// is_user_logged_in() - explicit login check
-	if userIsUserLoggedInPattern.MatchString(code) {
-		return true
-	}
-	// auth_redirect() - forces login redirect for non-authenticated users
-	if userAuthRedirectPattern.MatchString(code) {
-		return true
-	}
-	// get_current_user_id() followed by a comparison/validation
-	// Just calling get_current_user_id() doesn't mean auth is required,
-	// but using it in a condition like "if (!get_current_user_id())" does
-	// For now, we consider its presence as a login indicator
-	if userGetCurrentUserIdPattern.MatchString(code) {
-		// Additional check: is it being used in a conditional?
-		// Patterns like: if (!get_current_user_id()) or get_current_user_id() === 0
-		if strings.Contains(code, "!get_current_user_id") ||
-			strings.Contains(code, "get_current_user_id() === 0") ||
-			strings.Contains(code, "get_current_user_id() == 0") ||
-			strings.Contains(code, "get_current_user_id() > 0") ||
-			strings.Contains(code, "0 === get_current_user_id") ||
-			strings.Contains(code, "0 == get_current_user_id") {
-			return true
-		}
-	}
-	return false
-}
-
-// hasUserCheck checks for user-level authentication checks
-// DEPRECATED: Use hasUserLoginCheck for more accurate detection
-func hasUserCheck(code string) bool {
-	// NOTE: current_user_can is handled separately by extractCapabilityCheck
-	return userIsUserLoggedInPattern.MatchString(code) ||
-		userWpGetCurrentUserPattern.MatchString(code) ||
-		userGetCurrentUserIdPattern.MatchString(code)
-}
-
-// hasNonceCheck checks for nonce verification
-func hasNonceCheck(code string) bool {
-	return nonceWpVerifyPattern.MatchString(code) ||
-		nonceCheckAjaxPattern.MatchString(code) ||
-		nonceCheckAdminPattern.MatchString(code)
-}
-
 // hasPermissionCallback checks if permission_callback exists
 func hasPermissionCallback(code string) bool {
 	// Use pre-compiled package-level pattern
 	return permissionCallbackExistsPattern.MatchString(code)
 }
 
-// inferCapabilityAuthLevel applies pattern-based heuristics to determine auth level
-// for capabilities that are not in the known capability list.
-// This handles plugin-specific capabilities like manage_woocommerce, manage_elementor, etc.
-// Returns Unauthenticated if no pattern matches (caller should then use default User level).
+// ParsePermissionCallback extracts and analyzes the permission callback from a
+// route definition when no wider file context is available.
 //
-// GENERAL-PURPOSE PATTERNS (works across all WordPress plugins):
-// - manage_* : Admin level (WordPress pattern for plugin/feature administration)
-// - install_*, activate_*, update_*, delete_* + plugins/themes : Admin level
-// - *_users (create, edit, delete, promote, remove) : Admin level
-// - shop_manager related : Admin level (WooCommerce and similar e-commerce)
-func inferCapabilityAuthLevel(capability string) models.AuthLevel {
-	capability = strings.ToLower(capability)
-
-	// ============================================
-	// ADMIN-LEVEL PATTERNS
-	// These patterns indicate administrator-level access requirements
-	// ============================================
-
-	// Pattern: manage_* (manage_woocommerce, manage_elementor, manage_bookings, etc.)
-	// The manage_ prefix is the standard WordPress pattern for plugin administration
-	// capabilities. WordPress core uses manage_options, plugins follow this convention.
-	if strings.HasPrefix(capability, "manage_") {
-		return models.Admin
-	}
-
-	// Pattern: *_plugins or *_themes (install_plugins, activate_plugins, delete_themes, etc.)
-	// Any capability ending with _plugins or _themes is admin-level
-	if strings.HasSuffix(capability, "_plugins") || strings.HasSuffix(capability, "_themes") {
-		return models.Admin
-	}
-
-	// Pattern: install_*, activate_*, update_*, delete_* + common entities
-	// These are WordPress core patterns for entity management
-	adminActionPrefixes := []string{
-		"install_",
-		"activate_",
-		"update_",
-		"delete_",
-		"unfiltered_",
-	}
-	for _, prefix := range adminActionPrefixes {
-		if strings.HasPrefix(capability, prefix) {
-			return models.Admin
-		}
-	}
-
-	// Pattern: *_users (create_users, edit_users, delete_users, promote_users, remove_users)
-	// User management is always admin-level
-	if strings.HasSuffix(capability, "_users") {
-		return models.Admin
-	}
-
-	// Pattern: E-commerce shop capabilities
-	// Common in WooCommerce, Easy Digital Downloads, and similar e-commerce plugins
-	// Examples: edit_shop_orders, publish_shop_coupons, view_shop_reports, manage_shop_settings
-	// Also: shop_manager, shop_admin
-	if strings.Contains(capability, "_shop_") ||
-		strings.Contains(capability, "shop_") ||
-		strings.HasSuffix(capability, "_shop") {
-		return models.Admin
-	}
-
-	// Pattern: WooCommerce-specific capabilities
-	// Examples: view_woocommerce_reports, manage_woocommerce
-	if strings.Contains(capability, "woocommerce") {
-		return models.Admin
-	}
-
-	// Pattern: Backup/restore plugin capabilities
-	// Common in BackWPup, UpdraftPlus, and similar backup plugins
-	// Examples: backwpup, backwpup_jobs_start, backwpup_restore, updraftplus_*
-	backupKeywords := []string{"backwpup", "backup", "restore", "updraft", "migrate", "duplicator"}
-	for _, keyword := range backupKeywords {
-		if strings.Contains(capability, keyword) {
-			return models.Admin
-		}
-	}
-
-	// Pattern: edit_theme_options, customize_* (Customizer access)
-	// These control site appearance and are admin-level
-	if strings.HasPrefix(capability, "customize_") ||
-		capability == "edit_theme_options" {
-		return models.Admin
-	}
-
-	// Pattern: setup_* (setup_network, etc.)
-	// Setup capabilities are admin-level
-	if strings.HasPrefix(capability, "setup_") {
-		return models.Admin
-	}
-
-	// Pattern: upgrade_* (upgrade_network, etc.)
-	// Upgrade capabilities are admin-level
-	if strings.HasPrefix(capability, "upgrade_") {
-		return models.Admin
-	}
-
-	// ============================================
-	// EDITOR-LEVEL PATTERNS
-	// These patterns indicate editor-level access requirements
-	// ============================================
-
-	// Pattern: *_others_* capabilities (edit_others_*, delete_others_*, etc.)
-	// Editing/deleting OTHER users' content requires Editor level
-	// Examples: edit_others_products, delete_others_watermarks, edit_others_shop_orders
-	if strings.Contains(capability, "_others_") {
-		return models.Editor
-	}
-
-	// Pattern: *_private_* capabilities (read_private_*, edit_private_*, etc.)
-	// Accessing private content requires Editor level
-	// Examples: read_private_posts, edit_private_pages
-	if strings.Contains(capability, "_private_") {
-		return models.Editor
-	}
-
-	// Pattern: moderate_* (moderate_comments, etc.)
-	// Moderation requires Editor level
-	if strings.HasPrefix(capability, "moderate_") {
-		return models.Editor
-	}
-
-	// ============================================
-	// NO MATCH - Return Unauthenticated to signal caller should use default
-	// ============================================
-	return models.Unauthenticated
-}
-
-// ParsePermissionCallback extracts and analyzes the permission callback
+// Without a body to read there is nothing to say, because a callback's NAME
+// carries no privilege: core's own
+// WP_REST_Posts_Controller::get_items_permissions_check() returns true for
+// anonymous readers of a public post type, so even a name that follows core's
+// convention exactly tells you nothing. Callers holding the file should use
+// ParsePermissionCallbackWithContext.
 func ParsePermissionCallback(code string) (string, models.AuthLevel) {
-	// Use pre-compiled package-level patterns
-	// Order matters: try more specific patterns first, then flexible pattern as fallback
-	permCallbackPatterns := []*regexp.Regexp{
+	return ParsePermissionCallbackWithContext(code, code)
+}
+
+// ParsePermissionCallbackWithContext identifies a route's permission_callback
+// and resolves the level it enforces, reading the callback's body out of the
+// file the route is registered in.
+//
+// Everything here answers from what the callback DOES. The name-shaped
+// fallbacks that used to stand behind the body lookup are gone:
+//
+//	a name containing "check_admin" / "can_manage" / "is_admin"  -> Admin
+//	a name starting can_ / check_ / verify_ / require_           -> Subscriber
+//	any callback at all whose body could not be found            -> Subscriber
+//
+// The first is an over-restriction machine: the identical body
+// `return ! empty( $request->get_param('token') );` reported Admin when it lived
+// in another file and Unauthenticated when it lived in this one, purely because
+// of how the method was spelled. The other two report Subscriber for callbacks
+// that may assert nothing -- measured over the corpus, 46% of the
+// permission-callback methods declared outside the registering file check no
+// identity whatsoever.
+//
+// When the body cannot be found the answer is Unauthenticated. That
+// under-restricts a callback whose real check lives in a file this function
+// cannot reach, which is noise; reporting Subscriber over-restricts one that
+// checks nothing, which hides a reachable endpoint. Recovering the exactness
+// needs cross-file resolution through the class hierarchy, which belongs to the
+// caller that owns the plugin's file map, not here.
+func ParsePermissionCallbackWithContext(code string, fullFileContent string) (string, models.AuthLevel) {
+	// Order matters: try more specific patterns first, then the flexible one.
+	for _, re := range []*regexp.Regexp{
 		parsePermCallbackStringPattern,
 		parsePermCallbackArrayPattern,
 		parsePermCallbackArrayAltPattern,
-		parsePermCallbackFlexiblePattern, // Flexible pattern catches variations
-	}
-
-	for _, re := range permCallbackPatterns {
+		parsePermCallbackFlexiblePattern,
+	} {
 		matches := re.FindStringSubmatch(code)
-		if len(matches) >= 2 {
-			callback := matches[1]
-			// Note: The callback function analysis is done separately
-			// by ParsePermissionCallbackWithContext which has access to full file
-			level := InferAuthLevel(code)
-			return callback, level
+		if len(matches) < 2 {
+			continue
 		}
+		callback := matches[1]
+		if callback == "__return_true" {
+			return callback, models.Unauthenticated
+		}
+		body := findFunctionBody(callback, fullFileContent)
+		return callback, permissionCallbackBodyLevel(body, fullFileContent)
 	}
 
-	// Check for inline function using pre-compiled pattern
-	matches := parsePermCallbackInlinePattern.FindStringSubmatch(code)
-	if len(matches) >= 2 {
-		fnBody := matches[1]
-		level := InferAuthLevel(fnBody)
-		return "anonymous", level
-	}
-
-	// Check for PHP 7.4+ arrow function pattern
-	arrowMatches := parsePermCallbackArrowPattern.FindStringSubmatch(code)
-	if len(arrowMatches) >= 2 {
-		// Arrow function exists - method delegation likely requires auth
-		methodName := arrowMatches[1]
-		if methodName != "" {
-			if isStandardPermissionCallback(methodName) {
-				return "arrow:" + methodName, models.Subscriber
+	// An inline closure: 'permission_callback' => function ( $r ) { ... }
+	if loc := parsePermCallbackInlinePattern.FindStringIndex(code); loc != nil {
+		if bracePos := strings.Index(code[loc[0]:], "{"); bracePos >= 0 {
+			if fnBody := extractBracedContent(code, loc[0]+bracePos); fnBody != "" {
+				return "anonymous", permissionCallbackBodyLevel(fnBody, fullFileContent)
 			}
-			return "arrow:" + methodName, models.Subscriber
 		}
-		return "arrow_expr", models.Subscriber
+	}
+
+	// An arrow function: 'permission_callback' => fn( $r ) => $this->m( $r )
+	if arrowMatches := parsePermCallbackArrowPattern.FindStringSubmatch(code); len(arrowMatches) >= 2 {
+		if methodName := arrowMatches[1]; methodName != "" {
+			body := findFunctionBody(methodName, fullFileContent)
+			return "arrow:" + methodName, permissionCallbackBodyLevel(body, fullFileContent)
+		}
+		// The whole arrow body is one expression and core reads its value, so
+		// the expression is the gate. This branch used to return Subscriber for
+		// every arrow function regardless of what it said.
+		if len(arrowMatches) > 2 && strings.TrimSpace(arrowMatches[2]) != "" {
+			if lvl, ok := predicateLevel(arrowMatches[2]); ok {
+				return "arrow_expr", lvl
+			}
+			return "arrow_expr", models.Unauthenticated
+		}
 	}
 
 	return "", models.Unauthenticated
 }
 
-// ParsePermissionCallbackWithContext analyzes permission callback with full file context
-// This allows finding and analyzing the actual callback function definition
-func ParsePermissionCallbackWithContext(code string, fullFileContent string) (string, models.AuthLevel) {
-	// Use pre-compiled package-level patterns
-	// Order matters: try more specific patterns first, then flexible pattern as fallback
-	permCallbackPatterns := []*regexp.Regexp{
-		parsePermCallbackStringPattern,
-		parsePermCallbackArrayPattern,
-		parsePermCallbackArrayAltPattern,
-		parsePermCallbackFlexiblePattern, // Flexible pattern catches variations
+// permissionCallbackBodyLevel resolves what a permission callback enforces.
+//
+// A permission callback refuses in two ways and both are read here. It may
+// terminate -- `if ( ! current_user_can( X ) ) { return new WP_Error(...); }` --
+// which is the ordinary gating analysis. Or it may simply RETURN the verdict:
+// WP_REST_Server::dispatch_request() calls the callback and, on a falsy result
+// or a WP_Error, answers rest_forbidden without ever invoking the route's own
+// callback. So `return current_user_can( 'manage_options' );` requires
+// manage_options exactly as the terminating form does, with core rather than
+// the plugin doing the refusing. That is core behaviour and therefore holds for
+// every plugin; it is also why this is the one place a returned check may raise
+// a level, and why InferAuthLevel does not do the same for a handler that
+// merely computes a boolean.
+func permissionCallbackBodyLevel(funcBody string, fullFileContent string) models.AuthLevel {
+	return resolvePermissionBodyLevel(funcBody, fullFileContent, nil, 0)
+}
+
+// resolvePermissionBodyLevel resolves a permission-callback-shaped body: the
+// checks that gate it, the verdict it returns, or a check one call away that
+// this body's own control flow depends on.
+func resolvePermissionBodyLevel(funcBody, fileContent string, allContents map[string]string, depth int) models.AuthLevel {
+	if funcBody == "" || depth > maxRecursionDepth {
+		return models.Unauthenticated
 	}
-
-	for _, re := range permCallbackPatterns {
-		matches := re.FindStringSubmatch(code)
-		if len(matches) >= 2 {
-			callback := matches[1]
-
-			// Check for __return_true which is explicitly unauthenticated
-			if callback == "__return_true" {
-				return callback, models.Unauthenticated
-			}
-
-			// PRIORITY 1: Try to find and analyze the callback function body
-			// This is the most reliable method because it directly examines the
-			// actual capability check (e.g., current_user_can('manage_woocommerce'))
-			// rather than relying on naming conventions
-			if funcBody := findFunctionBody(callback, fullFileContent); funcBody != "" {
-				level := InferAuthLevel(funcBody)
-				// If we found a specific auth level, use it
-				if level != models.Unauthenticated {
-					return callback, level
-				}
-				// The body was found and analysed and it asserts nothing about
-				// who the caller is. Trust that.
-				//
-				// This used to fall through to Subscriber on the reasoning that
-				// "the presence of a named callback suggests auth is required".
-				// It does not. A permission callback is free to check anything,
-				// and plenty check something that is not identity at all:
-				//
-				//   public function impersonate_user_permissions_check( $request ) {
-				//       $name  = $request->get_param( 'username' );
-				//       $token = $request->get_param( 'multi_manager_wp_login_token' );
-				//       if ( empty( $name ) || empty( $token ) ) { return new WP_Error(...); }
-				//       return $this->impersonate_token_check( $name, $token );
-				//   }
-				//
-				// Everything it inspects comes from the request, so it
-				// establishes no privilege whatsoever -- which is precisely why
-				// CVE-2024-11028 is exploitable unauthenticated. Reporting
-				// Subscriber there overstates the privilege an attacker needs,
-				// which is the error direction that makes a real, reachable
-				// vulnerability look gated and get dismissed.
-				//
-				// Measured: this fallback produced 9 of the 16 remaining
-				// over-restrictions on a 148-CVE corpus, every one of them
-				// "truth unauthenticated, reported subscriber".
-				//
-				// A callback that delegates its real check elsewhere is still
-				// followed, because that is a case where the identity assertion
-				// exists and simply lives one call away.
-				if delegated := followCallbackDelegation(funcBody, fullFileContent, nil); delegated != models.Unauthenticated {
-					return callback, delegated
-				}
-				return callback, models.Unauthenticated
-			}
-
-			// PRIORITY 2: Check if callback name indicates admin-level permission check
-			// Use this only when function body analysis failed (function not found)
-			if isAdminPermissionCallbackName(callback) {
-				return callback, models.Admin
-			}
-
-			// PRIORITY 3: Check if callback name follows standard WordPress REST API
-			// permission patterns. These patterns (like *_permissions_check) require auth.
-			// Use this only as fallback when function body is not available.
-			if isStandardPermissionCallback(callback) {
-				return callback, models.Subscriber
-			}
-
-			// PRIORITY 4: Fallback - analyze just the local code context
-			level := InferAuthLevel(code)
-			// If no explicit auth pattern found but callback exists, assume Subscriber level
-			// (a permission_callback was specified, so auth is likely required)
-			if level == models.Unauthenticated && callback != "" {
-				level = models.Subscriber
-			}
-			return callback, level
-		}
+	if level := InferAuthLevelInFile(funcBody, fileContent); level != models.Unauthenticated {
+		return level
 	}
-
-	// Check for inline function (static function or anonymous function)
-	// Find the position of the function start
-	loc := parsePermCallbackInlinePattern.FindStringIndex(code)
-	if loc != nil {
-		// Find the opening brace
-		bracePos := strings.Index(code[loc[0]:], "{")
-		if bracePos >= 0 {
-			startPos := loc[0] + bracePos
-			// Extract function body using brace matching
-			fnBody := extractBracedContent(code, startPos)
-			if fnBody != "" {
-				// Check for current_user_can in the function body
-				capMatches := permCallbackCapabilityPattern.FindStringSubmatch(fnBody)
-				if len(capMatches) >= 2 {
-					capability := capMatches[1]
-					// Use configuration-based lookup first
-					if level, ok := getCapabilityLevel(capability); ok {
-						return "anonymous", level
-					}
-					// Fallback to initialized capability levels map
-					initCapabilityLevels()
-					if level, ok := capabilityLevels[capability]; ok {
-						return "anonymous", level
-					}
-					// Unknown capability, but requires login
-					return "anonymous", models.Subscriber
-				}
-
-				// Check for user_can($user, 'capability') pattern
-				// This is the same as current_user_can but with explicit user ID
-				userCanMatches := permCallbackUserCanPattern.FindStringSubmatch(fnBody)
-				if len(userCanMatches) >= 2 {
-					capability := userCanMatches[1]
-					// Use configuration-based lookup first
-					if level, ok := getCapabilityLevel(capability); ok {
-						return "anonymous", level
-					}
-					// Fallback to initialized capability levels map
-					initCapabilityLevels()
-					if level, ok := capabilityLevels[capability]; ok {
-						return "anonymous", level
-					}
-					// Unknown capability, but requires login
-					return "anonymous", models.Subscriber
-				}
-
-				// Check for method delegation pattern
-				// This handles patterns like: return $this->get_permission_callback($request)
-				// Common in WordPress REST controllers (WP_REST_Controller subclasses)
-				delegationMatches := permCallbackMethodDelegationPattern.FindStringSubmatch(fnBody)
-				if len(delegationMatches) >= 2 {
-					delegatedMethodName := delegationMatches[1]
-					// Try to find and analyze the delegated method
-					if delegatedMethodBody := findFunctionBody(delegatedMethodName, fullFileContent); delegatedMethodBody != "" {
-						// Analyze the delegated method for capability checks
-						delegatedCapMatches := permCallbackCapabilityPattern.FindStringSubmatch(delegatedMethodBody)
-						if len(delegatedCapMatches) >= 2 {
-							capability := delegatedCapMatches[1]
-							if level, ok := getCapabilityLevel(capability); ok {
-								return "delegated:" + delegatedMethodName, level
-							}
-							initCapabilityLevels()
-							if level, ok := capabilityLevels[capability]; ok {
-								return "delegated:" + delegatedMethodName, level
-							}
-							return "delegated:" + delegatedMethodName, models.Subscriber
-						}
-						// Also check for user_can($user, 'capability') pattern
-						delegatedUserCanMatches := permCallbackUserCanPattern.FindStringSubmatch(delegatedMethodBody)
-						if len(delegatedUserCanMatches) >= 2 {
-							capability := delegatedUserCanMatches[1]
-							if level, ok := getCapabilityLevel(capability); ok {
-								return "delegated:" + delegatedMethodName, level
-							}
-							initCapabilityLevels()
-							if level, ok := capabilityLevels[capability]; ok {
-								return "delegated:" + delegatedMethodName, level
-							}
-							return "delegated:" + delegatedMethodName, models.Subscriber
-						}
-						// Analyze the full delegated method body
-						level := InferAuthLevel(delegatedMethodBody)
-						// If no explicit auth pattern found in delegated method,
-						// but a delegation pattern exists, assume at least User level
-						if level == models.Unauthenticated {
-							level = models.Subscriber
-						}
-						return "delegated:" + delegatedMethodName, level
-					}
-					// Method name suggests permission check - assume requires auth
-					// Check both standard REST API patterns (isStandardPermissionCallback) and
-					// general permission check patterns (isPermissionCheckFunctionName)
-					// Examples: user_can_view, user_can_manage contain "_can_" pattern
-					if isStandardPermissionCallback(delegatedMethodName) || isPermissionCheckFunctionName(delegatedMethodName) {
-						return "delegated:" + delegatedMethodName, models.Subscriber
-					}
-				}
-
-				// Check for STATIC method delegation pattern
-				// This handles patterns like: return Two_Factor_Core::rest_api_can_edit_user_and_update_two_factor_options($request['user_id'])
-				// Common in WordPress plugins where permission checks are centralized in a core class
-				staticDelegationMatches := permCallbackStaticDelegationPattern.FindStringSubmatch(fnBody)
-				if len(staticDelegationMatches) >= 3 {
-					className := staticDelegationMatches[1]
-					methodName := staticDelegationMatches[2]
-					fullMethodRef := className + "::" + methodName
-
-					// Try to find the static method in the current file content
-					if staticMethodBody := findStaticMethodBody(className, methodName, fullFileContent); staticMethodBody != "" {
-						// Recursively analyze the static method for capability checks
-						level := findCapabilityInCallChain(staticMethodBody, fullFileContent, 0)
-						if level != models.Unauthenticated {
-							return "static:" + fullMethodRef, level
-						}
-					}
-
-					// Method name suggests permission check - assume requires auth
-					// Common patterns: can_*, has_*, check_*, verify_*, *_permission*, etc.
-					if isPermissionCheckFunctionName(methodName) {
-						return "static:" + fullMethodRef, models.Subscriber
-					}
-
-					// A static method call in permission_callback that we couldn't analyze
-					// is likely a permission check - be conservative and assume requires auth
-					return "static:" + fullMethodRef, models.Subscriber
-				}
-
-				// Check for standalone function call delegation
-				// This handles patterns like: return some_permission_function($args)
-				functionDelegationMatches := permCallbackFunctionDelegationPattern.FindStringSubmatch(fnBody)
-				if len(functionDelegationMatches) >= 2 {
-					funcName := functionDelegationMatches[1]
-
-					// Skip WordPress built-in functions that don't indicate auth
-					if !isNonAuthFunction(funcName) {
-						// Try to find the function in the current file
-						if funcBody := findFunctionBody(funcName, fullFileContent); funcBody != "" {
-							level := findCapabilityInCallChain(funcBody, fullFileContent, 0)
-							if level != models.Unauthenticated {
-								return "function:" + funcName, level
-							}
-						}
-
-						// Function name suggests permission check
-						if isPermissionCheckFunctionName(funcName) {
-							return "function:" + funcName, models.Subscriber
-						}
-					}
-				}
-
-				// Analyze the full function body
-				level := InferAuthLevel(fnBody)
-				return "anonymous", level
-			}
-		}
+	if level, ok := permissionCallbackLevel(funcBody); ok {
+		return level
 	}
-
-	// Check for PHP 7.4+ arrow function pattern: fn($request) => $this->method($request)
-	// Arrow functions don't have braces, so we need a different approach
-	arrowMatches := parsePermCallbackArrowPattern.FindStringSubmatch(code)
-	if len(arrowMatches) >= 2 {
-		// Group 1 is the method name if it's a $this->method() call
-		// Group 2 is the fallback expression
-		methodName := arrowMatches[1]
-		if methodName != "" {
-			// Try to find and analyze the delegated method
-			if delegatedMethodBody := findFunctionBody(methodName, fullFileContent); delegatedMethodBody != "" {
-				// Analyze the delegated method for capability checks
-				delegatedCapMatches := permCallbackCapabilityPattern.FindStringSubmatch(delegatedMethodBody)
-				if len(delegatedCapMatches) >= 2 {
-					capability := delegatedCapMatches[1]
-					if level, ok := getCapabilityLevel(capability); ok {
-						return "arrow:" + methodName, level
-					}
-					initCapabilityLevels()
-					if level, ok := capabilityLevels[capability]; ok {
-						return "arrow:" + methodName, level
-					}
-					return "arrow:" + methodName, models.Subscriber
-				}
-				// Also check for user_can($user, 'capability') pattern
-				delegatedUserCanMatches := permCallbackUserCanPattern.FindStringSubmatch(delegatedMethodBody)
-				if len(delegatedUserCanMatches) >= 2 {
-					capability := delegatedUserCanMatches[1]
-					if level, ok := getCapabilityLevel(capability); ok {
-						return "arrow:" + methodName, level
-					}
-					initCapabilityLevels()
-					if level, ok := capabilityLevels[capability]; ok {
-						return "arrow:" + methodName, level
-					}
-					return "arrow:" + methodName, models.Subscriber
-				}
-				// Analyze the full delegated method body
-				level := InferAuthLevel(delegatedMethodBody)
-				// If no explicit auth pattern found in delegated method,
-				// but a delegation pattern exists, assume at least User level
-				if level == models.Unauthenticated {
-					level = models.Subscriber
-				}
-				return "arrow:" + methodName, level
-			}
-			// Method name suggests permission check - assume requires auth
-			// Check both standard REST API patterns and general permission check patterns
-			// (consistent with inline function method delegation handling)
-			if isStandardPermissionCallback(methodName) || isPermissionCheckFunctionName(methodName) {
-				return "arrow:" + methodName, models.Subscriber
-			}
-			// Named method but couldn't find body - assume User level
-			return "arrow:" + methodName, models.Subscriber
-		}
-
-		// Fallback: check expression for patterns (group 2)
-		if len(arrowMatches) > 2 && arrowMatches[2] != "" {
-			expr := arrowMatches[2]
-			// Check if expression contains current_user_can
-			capMatches := permCallbackCapabilityPattern.FindStringSubmatch(expr)
-			if len(capMatches) >= 2 {
-				capability := capMatches[1]
-				if level, ok := getCapabilityLevel(capability); ok {
-					return "arrow_expr", level
-				}
-				initCapabilityLevels()
-				if level, ok := capabilityLevels[capability]; ok {
-					return "arrow_expr", level
-				}
-				return "arrow_expr", models.Subscriber
-			}
-			// Also check for user_can($user, 'capability') pattern
-			userCanMatches := permCallbackUserCanPattern.FindStringSubmatch(expr)
-			if len(userCanMatches) >= 2 {
-				capability := userCanMatches[1]
-				if level, ok := getCapabilityLevel(capability); ok {
-					return "arrow_expr", level
-				}
-				initCapabilityLevels()
-				if level, ok := capabilityLevels[capability]; ok {
-					return "arrow_expr", level
-				}
-				return "arrow_expr", models.Subscriber
-			}
-			// Arrow function exists but couldn't analyze - assume User level
-			return "arrow_expr", models.Subscriber
-		}
-	}
-
-	return "", models.Unauthenticated
+	// The body asserts nothing about who is calling. Trust that.
+	//
+	// This used to fall through to Subscriber on the reasoning that "the
+	// presence of a named callback suggests auth is required". It does not. A
+	// permission callback is free to check anything, and plenty check something
+	// that is not identity at all:
+	//
+	//   public function impersonate_user_permissions_check( $request ) {
+	//       $name  = $request->get_param( 'username' );
+	//       $token = $request->get_param( 'multi_manager_wp_login_token' );
+	//       if ( empty( $name ) || empty( $token ) ) { return new WP_Error(...); }
+	//       return $this->impersonate_token_check( $name, $token );
+	//   }
+	//
+	// Everything it inspects comes from the request, so it establishes no
+	// privilege whatsoever -- which is precisely why CVE-2024-11028 is
+	// exploitable unauthenticated. Reporting Subscriber there overstates the
+	// privilege an attacker needs, which is the error direction that makes a
+	// real, reachable vulnerability look gated and get dismissed.
+	//
+	// A callback that delegates its real check elsewhere is still followed,
+	// because that is a case where the identity assertion exists and simply
+	// lives one call away.
+	return delegatedAuthLevel(funcBody, fileContent, allContents, delegationInPermissionCallback, depth)
 }
 
 // findFunctionBody finds a function/method definition and extracts its body
@@ -1226,99 +704,6 @@ func extractBracedContent(content string, startPos int) string {
 		maxLen = len(content)
 	}
 	return content[startPos:maxLen]
-}
-
-// isAdminPermissionCallbackName checks if a permission callback name suggests admin-level access
-func isAdminPermissionCallbackName(callback string) bool {
-	callback = strings.ToLower(callback)
-
-	// Normalize separators
-	normalized := strings.ReplaceAll(callback, "-", "_")
-	normalized = strings.ReplaceAll(normalized, "::", "_")
-
-	// Strong indicators of admin permission callbacks
-	adminIndicators := []string{
-		"admin_permission",
-		"check_admin",
-		"admin_check",
-		"require_admin",
-		"is_admin",
-		"can_manage",
-		"manage_permission",
-		"manage_check",
-		"permission_admin",
-		"editor_permission",
-		"current_user_can_manage",
-		"verify_admin",
-		"check_permission_admin",
-	}
-
-	for _, indicator := range adminIndicators {
-		if strings.Contains(normalized, indicator) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// isStandardPermissionCallback checks if a callback name follows standard WordPress REST API
-// permission callback naming conventions that require authentication.
-// This is a general-purpose pattern that works across ALL WordPress plugins.
-//
-// Standard patterns include:
-// - *_permissions_check (WP REST API standard: get_items_permissions_check, create_item_permissions_check)
-// - *_permission_check (singular form)
-// - check_*_permission* (prefix form: check_read_permission, check_edit_permissions)
-// - can_* (capability check methods: can_edit, can_delete)
-// - verify_* (verification methods usually require auth)
-// - has_permission* (permission check methods)
-//
-// These patterns indicate the endpoint requires authentication (at minimum User level).
-func isStandardPermissionCallback(callback string) bool {
-	callback = strings.ToLower(callback)
-
-	// Normalize separators
-	normalized := strings.ReplaceAll(callback, "-", "_")
-	normalized = strings.ReplaceAll(normalized, "::", "_")
-
-	// Standard WordPress REST API permission callback patterns
-	// These patterns are used across the entire WordPress ecosystem
-	standardPatterns := []string{
-		"_permissions_check", // WP REST API: get_items_permissions_check, create_item_permissions_check
-		"_permission_check",  // Singular: get_item_permission_check
-		"permissions_check",  // Ends with permissions_check
-		"permission_check",   // Ends with permission_check
-		"check_permission",   // check_permission, check_permissions
-		"has_permission",     // has_permission, has_permissions
-		"verify_permission",  // verify_permission methods
-		"validate_request",   // request validation often includes auth
-	}
-
-	for _, pattern := range standardPatterns {
-		if strings.Contains(normalized, pattern) {
-			return true
-		}
-	}
-
-	// Also check for patterns that START with certain prefixes (common convention)
-	startPatterns := []string{
-		"can_",     // can_edit, can_delete, can_view
-		"check_",   // check_read, check_write (when followed by action)
-		"verify_",  // verify_user, verify_access
-		"require_", // require_auth, require_permission
-	}
-
-	for _, prefix := range startPatterns {
-		if strings.HasPrefix(normalized, prefix) {
-			// But exclude certain false positives
-			if !strings.Contains(normalized, "nonce") { // can check nonce without auth
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // NormalizeCallback normalizes callback notation to a readable format
@@ -1464,157 +849,180 @@ func findStaticMethodBody(className, methodName, content string) string {
 // maxRecursionDepth limits how deep we trace function calls
 const maxRecursionDepth = 5
 
-// findCapabilityInCallChain recursively searches through function bodies
-// to find capability checks like current_user_can(), is_user_logged_in(), etc.
-// This handles cases where permission_callback delegates to helper functions
-// that in turn call other functions containing the actual capability check.
+// findCapabilityInCallChain follows a permission callback's delegation chain,
+// answering only from the bodies it can actually read.
+//
+// It used to answer from names as well. A callee whose name contained "can_",
+// "_can_", "has_cap", "is_allowed", "can_access", "check_access" or ended in
+// "_permission" produced Subscriber; a body that merely mentioned
+// manage_options anywhere produced Admin; a body that merely mentioned
+// is_user_logged_in produced Subscriber. All three are the presence rule
+// wearing another costume, and the record of what the first one costs is one
+// function away in this file: impersonate_user_permissions_check is called in a
+// gating position, is spelled exactly like a permission check, and inspects
+// only request parameters.
 func findCapabilityInCallChain(funcBody, fullContent string, depth int) models.AuthLevel {
-	// Prevent infinite recursion
-	if depth > maxRecursionDepth {
-		return models.Unauthenticated
-	}
-
-	// Priority 1: Direct capability check in this function
-	capability := extractCapabilityCheck(funcBody)
-	if capability != "" {
-		if level, ok := getCapabilityLevel(capability); ok {
-			return level
-		}
-		initCapabilityLevels()
-		if level, ok := capabilityLevels[capability]; ok {
-			return level
-		}
-		// Unknown capability - try pattern-based inference
-		if level := inferCapabilityAuthLevel(capability); level != models.Unauthenticated {
-			return level
-		}
-		// Unknown capability but it's a capability check - at least Subscriber
-		return models.Subscriber
-	}
-
-	// Priority 2: Admin-level capability check patterns
-	if hasAdminCapabilityCheck(funcBody) {
-		return models.Admin
-	}
-
-	// Priority 3: User login checks
-	if hasUserLoginCheck(funcBody) {
-		return models.Subscriber
-	}
-
-	// Priority 4: Look for function calls that might contain capability checks
-	// Find static method calls: ClassName::method() (using pre-compiled pattern)
-	staticMatches := callChainStaticCallPattern.FindAllStringSubmatch(funcBody, -1)
-	for _, match := range staticMatches {
-		if len(match) >= 3 {
-			calledMethod := match[2]
-			// Try to find the method body
-			if methodBody := findStaticMethodBody(match[1], calledMethod, fullContent); methodBody != "" {
-				level := findCapabilityInCallChain(methodBody, fullContent, depth+1)
-				if level != models.Unauthenticated {
-					return level
-				}
-			}
-			// If method name suggests permission check, treat as authenticated
-			if isPermissionCheckFunctionName(calledMethod) {
-				return models.Subscriber
-			}
-		}
-	}
-
-	// Find instance method calls: $this->method() or $var->method() (using pre-compiled pattern)
-	instanceMatches := callChainInstanceCallPattern.FindAllStringSubmatch(funcBody, -1)
-	for _, match := range instanceMatches {
-		if len(match) >= 2 {
-			calledMethod := match[1]
-			// Try to find the method body
-			if methodBody := findFunctionBody(calledMethod, fullContent); methodBody != "" {
-				level := findCapabilityInCallChain(methodBody, fullContent, depth+1)
-				if level != models.Unauthenticated {
-					return level
-				}
-			}
-			// If method name suggests permission check, treat as authenticated
-			if isPermissionCheckFunctionName(calledMethod) {
-				return models.Subscriber
-			}
-		}
-	}
-
-	// Find standalone function calls: function_name() (using pre-compiled pattern)
-	funcMatches := callChainFuncCallPattern.FindAllStringSubmatch(funcBody, -1)
-	for _, match := range funcMatches {
-		if len(match) >= 2 {
-			calledFunc := match[1]
-			// Skip known non-auth functions and PHP built-ins
-			if isNonAuthFunction(calledFunc) {
-				continue
-			}
-			// Try to find the function body
-			if funcBodyFound := findFunctionBody(calledFunc, fullContent); funcBodyFound != "" {
-				level := findCapabilityInCallChain(funcBodyFound, fullContent, depth+1)
-				if level != models.Unauthenticated {
-					return level
-				}
-			}
-			// If function name suggests permission check, treat as authenticated
-			if isPermissionCheckFunctionName(calledFunc) {
-				return models.Subscriber
-			}
-		}
-	}
-
-	return models.Unauthenticated
+	return resolvePermissionBodyLevel(funcBody, fullContent, nil, depth)
 }
 
-// isPermissionCheckFunctionName checks if a function/method name suggests it performs permission checking.
-// This is a GENERAL-PURPOSE check that works across all WordPress plugins.
-func isPermissionCheckFunctionName(name string) bool {
-	name = strings.ToLower(name)
+// delegationContext says what a call's RESULT means in the body that makes it.
+type delegationContext int
 
-	// Normalize separators
-	normalized := strings.ReplaceAll(name, "-", "_")
+const (
+	// delegationInHandler: the body is an endpoint callback. Returning a
+	// delegate's boolean ends the handler; it refuses nothing.
+	delegationInHandler delegationContext = iota
+	// delegationInPermissionCallback: the body's return value is the verdict
+	// core acts on, so `return $this->check( $r );` makes check() the gate.
+	delegationInPermissionCallback
+)
 
-	// Patterns that indicate permission checking
-	permissionIndicators := []string{
-		"can_",           // can_edit, can_delete, can_manage
-		"_can_",          // user_can_edit, rest_api_can_
-		"has_permission", // has_permission, has_permissions
-		"check_permission",
-		"verify_permission",
-		"permission_check",
-		"permissions_check",
-		"has_cap",      // has_capability
-		"check_cap",    // check_capability
-		"verify_cap",   // verify_capability
-		"is_allowed",   // is_allowed_to_*
-		"can_access",   // can_access_*
-		"check_access", // check_access_*
-		"user_can",     // user_can_edit, current_user_can
-		"require_cap",  // require_capability
+// delegatedAuthLevel follows the calls a body makes and reports the level of
+// the ones that actually gate it.
+//
+// A delegate's level transfers to its caller only when failing the delegate
+// stops the caller, and there are exactly two ways for that to happen:
+//
+//   - The CALL SITE gates. `if ( ! $this->check() ) { wp_die(); }`, or -- in a
+//     permission callback, whose return value core reads as the verdict --
+//     `return $this->check( $request );`. The caller's own control flow does
+//     the refusing, so whatever the delegate asserts is the requirement.
+//
+//   - The DELEGATE ends the request itself: its guard finishes in wp_die, exit,
+//     throw or wp_send_json_*, which stop the request from any call depth. A
+//     guard whose only consequence is `return` does not qualify, because
+//     `return` hands control back to the caller, which carries on:
+//
+//     function handle() { save( $_POST['v'] ); $this->render_admin_notice(); }
+//     function render_admin_notice() { if ( ! current_user_can('manage_options') ) return; echo 'hi'; }
+//
+//     That handler is completely unguarded and used to report Admin, because
+//     the delegate's level was inherited for any call appearing anywhere in the
+//     body -- not only calls before the sink, and not only calls whose result
+//     was consumed.
+//
+// Among the delegates that do gate, the MINIMUM wins. Sequential gates are
+// conjunctive, so the exact answer would be their maximum; but the maximum is
+// the over-restricting direction, and this walk collects up to five calls that
+// may not all be gates. The minimum is the cheapest way in that we can see.
+//
+// A delegate that resolves to the very body we started from is skipped.
+// findFunctionBody matches on the bare method name, so
+// `$this->file_manager->temp_file_delete( $id )` inside temp_file_delete()
+// re-finds temp_file_delete() and the handler inherits its own checks. The test
+// is body identity rather than name equality, so a genuine same-named delegate
+// on a collaborator class -- Foo::check() calling $this->guard->check() -- is
+// still followed.
+func delegatedAuthLevel(funcBody, fileContent string, allContents map[string]string, ctx delegationContext, depth int) models.AuthLevel {
+	if funcBody == "" || depth >= maxRecursionDepth {
+		return models.Unauthenticated
 	}
+	mask := maskNonCode(funcBody)
+	decls := FindFunctionDeclarations(mask)
 
-	for _, indicator := range permissionIndicators {
-		if strings.Contains(normalized, indicator) {
-			return true
+	best := models.AuthLevel(-1)
+	consider := func(callStart, parenClose int, methodBody string) {
+		if methodBody == "" || methodBody == funcBody {
+			return
+		}
+		var level models.AuthLevel
+		if callSiteGates(mask, decls, callStart, parenClose, ctx) {
+			level = resolvePermissionBodyLevel(methodBody, fileContent, allContents, depth+1)
+		} else {
+			// The call is unconditional, so only a delegate that ends the
+			// request on its own can gate anything here.
+			level = InferAuthLevelInScope(methodBody, fileContent, ScopeHelper)
+		}
+		if level == models.Unauthenticated {
+			return
+		}
+		if best < 0 || level < best {
+			best = level
 		}
 	}
 
-	// Check for patterns that END with permission indicators
-	endPatterns := []string{
-		"_permission",
-		"_permissions",
-		"_capability",
-		"_capabilities",
+	// Instance method calls: $this->method() or $this->property->method().
+	for _, m := range callChainInstanceCallPattern.FindAllStringSubmatchIndex(mask, 5) {
+		calledMethod := mask[m[2]:m[3]]
+		if isNonAuthFunction(calledMethod) {
+			continue
+		}
+		parenClose := matchDelimiter(mask, m[1]-1, '(', ')')
+		if parenClose < 0 {
+			continue
+		}
+		body, _ := findCallbackBodyAcross(calledMethod, fileContent, allContents)
+		consider(m[0], parenClose, body)
 	}
 
-	for _, pattern := range endPatterns {
-		if strings.HasSuffix(normalized, pattern) {
-			return true
+	// Static method calls: ClassName::method().
+	for _, m := range callChainStaticCallPattern.FindAllStringSubmatchIndex(mask, 5) {
+		className, calledMethod := mask[m[2]:m[3]], mask[m[4]:m[5]]
+		if isNonAuthFunction(calledMethod) {
+			continue
+		}
+		parenClose := matchDelimiter(mask, m[1]-1, '(', ')')
+		if parenClose < 0 {
+			continue
+		}
+		body := findStaticMethodBody(className, calledMethod, fileContent)
+		if body == "" {
+			body, _ = findCallbackBodyAcross(calledMethod, fileContent, allContents)
+		}
+		consider(m[0], parenClose, body)
+	}
+
+	if best < 0 {
+		return models.Unauthenticated
+	}
+	return best
+}
+
+// callSiteGates reports whether the caller's control flow depends on this
+// call's result.
+func callSiteGates(mask string, decls []FuncDecl, callStart, parenClose int, ctx delegationContext) bool {
+	if classifyCheck(mask, decls, callStart, parenClose, ScopeRequest) == GuardFunction {
+		return true
+	}
+	if ctx != delegationInPermissionCallback {
+		return false
+	}
+	// `return $this->check( $r );` -- core turns a falsy return into
+	// rest_forbidden, so the delegate's answer is the route's answer. A negated
+	// or compound return is not accepted: negation inverts the verdict, and a
+	// compound one admits callers the delegate would have refused.
+	prefix := strings.TrimSpace(mask[statementStart(mask, callStart):callStart])
+	return strings.EqualFold(prefix, "return")
+}
+
+// followCallbackDelegation follows the delegation a handler body performs.
+func followCallbackDelegation(funcBody string, fileContent string, allContents map[string]string) models.AuthLevel {
+	return delegatedAuthLevel(funcBody, fileContent, allContents, delegationInHandler, 0)
+}
+
+// findCallbackBodyAcross resolves a function body, preferring the file that
+// registered the callback.
+//
+// The fallback across the other files iterates in sorted order. A Go map's
+// iteration order is randomised per run, so the previous `for _, content :=
+// range allContents { ... break }` resolved a name declared in two files to a
+// different body on each run -- and 72 of 215 distinct permission-callback
+// method names in the corpus have two or more declarations in the same plugin.
+func findCallbackBodyAcross(funcName, fileContent string, allContents map[string]string) (body, content string) {
+	if b := findFunctionBody(funcName, fileContent); b != "" {
+		return b, fileContent
+	}
+	names := make([]string, 0, len(allContents))
+	for name := range allContents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if b := findFunctionBody(funcName, allContents[name]); b != "" {
+			return b, allContents[name]
 		}
 	}
-
-	return false
+	return "", fileContent
 }
 
 // nonAuthFuncs contains PHP/WordPress built-in functions that do NOT relate to authentication.
@@ -1667,170 +1075,58 @@ func isNonAuthFunction(name string) bool {
 	return nonAuthFuncs[name]
 }
 
-// InferAuthLevelFromCallback checks the callback function body for auth patterns.
-// This handles the case where wp_ajax_nopriv_ endpoints have internal auth checks
-// (W7 fix: the #1 cause of false positives at 25-35%).
-// It reads the callback body from the file content and scans for auth patterns.
-// Returns the highest auth level found, or Unauthenticated if no auth checks detected.
+// InferAuthLevelFromCallback checks an endpoint callback's body for the checks
+// that gate it.
+//
+// This is the path a wp_ajax_nopriv_ registration takes: the plugin has said
+// uid 0 may reach the action, and the question is whether the handler itself
+// refuses anyone.
 func InferAuthLevelFromCallback(callbackName string, fileContent string, allContents map[string]string) models.AuthLevel {
-	// Normalize the callback name to extract the actual method/function name
 	funcName := extractCallbackFuncName(callbackName)
 	if funcName == "" {
 		return models.Unauthenticated
 	}
 
-	// Try to find the callback body in the primary file
-	funcBody := findFunctionBody(funcName, fileContent)
-
-	// If not found, search all other files
-	if funcBody == "" && allContents != nil {
-		for _, content := range allContents {
-			funcBody = findFunctionBody(funcName, content)
-			if funcBody != "" {
-				break
-			}
-		}
-	}
-
+	funcBody, content := findCallbackBodyAcross(funcName, fileContent, allContents)
 	if funcBody == "" {
 		return models.Unauthenticated
 	}
 
-	// Run InferAuthLevel on the callback body
-	level := InferAuthLevel(funcBody)
-	if level > models.Unauthenticated {
+	if level := InferAuthLevelInFile(funcBody, content); level > models.Unauthenticated {
 		return level
 	}
 
-	// Nonce verification (wp_verify_nonce, check_ajax_referer) is CSRF protection,
-	// not authentication. It does NOT imply the endpoint requires login.
-	// Unauthenticated users can obtain nonces via wp_localize_script output.
-
-	// Follow one level of method delegation patterns in the callback body.
-	// Patterns: $this->check_auth(), self::validate(), $this->is_valid_call()
-	delegatedLevel := followCallbackDelegation(funcBody, fileContent, allContents)
-	if delegatedLevel > level {
-		level = delegatedLevel
-	}
-
-	return level
+	// The body itself asserts nothing, so the check may live one call away --
+	// but only a call this body's control flow depends on, or a delegate that
+	// ends the request itself, gates anything here.
+	//
+	// A nonce found down that path used to raise the answer to Subscriber, and
+	// it cannot. check_ajax_referer() proves the request carries a token minted
+	// for this action and this identity; for an action registered with
+	// wp_ajax_nopriv_ the plugin has declared uid 0 may reach it, so the nonce
+	// is by construction obtainable by uid 0 and is printed into public page
+	// HTML by wp_localize_script or wp_nonce_field. The rule also made handlers
+	// promote themselves: findFunctionBody resolves a delegate by bare name, so
+	// `$this->file_manager->temp_file_delete( $id )` inside temp_file_delete()
+	// found the handler again, and the handler's own check_ajax_referer() came
+	// back as a delegated identity assertion.
+	return delegatedAuthLevel(funcBody, content, allContents, delegationInHandler, 0)
 }
 
-// EnhancePermissionCallback follows permission_callback delegation chains deeper.
-// When permission_callback => [$this, 'check_permissions'], it reads check_permissions
-// body and follows up to 2 levels of delegation to find actual capability checks (W5 fix).
+// EnhancePermissionCallback follows a permission_callback's delegation chain,
+// reading each body it can resolve.
 func EnhancePermissionCallback(callbackName string, fileContent string, allContents map[string]string) models.AuthLevel {
 	funcName := extractCallbackFuncName(callbackName)
 	if funcName == "" {
 		return models.Unauthenticated
 	}
 
-	// Try to find the callback body in the primary file
-	funcBody := findFunctionBody(funcName, fileContent)
-
-	// If not found, search all other files
-	if funcBody == "" && allContents != nil {
-		for _, content := range allContents {
-			funcBody = findFunctionBody(funcName, content)
-			if funcBody != "" {
-				// Use this file as the context for deeper analysis
-				fileContent = content
-				break
-			}
-		}
-	}
-
+	funcBody, content := findCallbackBodyAcross(funcName, fileContent, allContents)
 	if funcBody == "" {
 		return models.Unauthenticated
 	}
 
-	// Use findCapabilityInCallChain which already handles recursive delegation
-	// up to maxRecursionDepth (5 levels)
-	return findCapabilityInCallChain(funcBody, fileContent, 0)
-}
-
-// followCallbackDelegation follows method delegation patterns in a callback body.
-// Looks for patterns like $this->check_auth(), self::validate(), $this->is_valid_call()
-// and analyzes the delegated method for auth checks.
-func followCallbackDelegation(funcBody string, fileContent string, allContents map[string]string) models.AuthLevel {
-	bestLevel := models.Unauthenticated
-
-	// Check instance method calls: $this->method() or $this->property->method()
-	instanceMatches := callChainInstanceCallPattern.FindAllStringSubmatch(funcBody, 5)
-	for _, match := range instanceMatches {
-		if len(match) < 2 {
-			continue
-		}
-		calledMethod := match[1]
-		if isNonAuthFunction(calledMethod) {
-			continue
-		}
-
-		// Try to find in primary file
-		methodBody := findFunctionBody(calledMethod, fileContent)
-		// Try other files if not found
-		if methodBody == "" && allContents != nil {
-			for _, content := range allContents {
-				methodBody = findFunctionBody(calledMethod, content)
-				if methodBody != "" {
-					break
-				}
-			}
-		}
-
-		if methodBody != "" {
-			level := InferAuthLevel(methodBody)
-			if level > bestLevel {
-				bestLevel = level
-			}
-			// Also check for nonce in delegated method
-			if bestLevel == models.Unauthenticated && hasNonceCheck(methodBody) {
-				bestLevel = models.Subscriber
-			}
-		}
-	}
-
-	// Check static method calls: ClassName::method()
-	staticMatches := callChainStaticCallPattern.FindAllStringSubmatch(funcBody, 5)
-	for _, match := range staticMatches {
-		if len(match) < 3 {
-			continue
-		}
-		calledMethod := match[2]
-		if isNonAuthFunction(calledMethod) {
-			continue
-		}
-
-		// Try to find the static method in the primary file first
-		methodBody := findStaticMethodBody(match[1], calledMethod, fileContent)
-		if methodBody == "" {
-			methodBody = findFunctionBody(calledMethod, fileContent)
-		}
-		// Try other files
-		if methodBody == "" && allContents != nil {
-			for _, content := range allContents {
-				methodBody = findStaticMethodBody(match[1], calledMethod, content)
-				if methodBody == "" {
-					methodBody = findFunctionBody(calledMethod, content)
-				}
-				if methodBody != "" {
-					break
-				}
-			}
-		}
-
-		if methodBody != "" {
-			level := InferAuthLevel(methodBody)
-			if level > bestLevel {
-				bestLevel = level
-			}
-			if bestLevel == models.Unauthenticated && hasNonceCheck(methodBody) {
-				bestLevel = models.Subscriber
-			}
-		}
-	}
-
-	return bestLevel
+	return resolvePermissionBodyLevel(funcBody, content, allContents, 0)
 }
 
 // extractCallbackFuncName extracts the actual function/method name from various callback formats.
@@ -1906,45 +1202,190 @@ func InferAuthLevelFromCallbackWithAST(callbackName string, fileContent string, 
 	return level
 }
 
-
-// resolveCapabilityLevel maps a capability string onto the ladder using the
-// same precedence InferAuthLevel has always used: configuration first, then the
-// built-in table, then the pattern heuristics for capabilities a plugin
-// generates at runtime.
+// resolveCapabilityLevel maps a capability string onto the ladder.
 func resolveCapabilityLevel(capability string) (models.AuthLevel, bool) {
+	return resolveCapabilityForSubject(capability, false)
+}
+
+// resolveCapabilityForSubject maps a capability onto the ladder, given whether
+// the check named the object it is testing against.
+//
+// The precedence is: what the operator configured, then what map_meta_cap does
+// with the capability, then the core table, then the floor.
+//
+// The pattern heuristics that used to end this function are gone. They raised
+// any unrecognised capability from the shape of its name -- manage_* and
+// *_users to Admin, *_others_* and *_private_* to Editor, and anything
+// containing "shop_", "woocommerce", "backup", "restore", "updraft" or
+// "duplicator" to Admin. WordPress assigns no meaning to the shape of a
+// capability name: WP_User::get_role_caps() builds $allcaps by merging the
+// capability arrays of whatever roles the site's wp_user_roles option holds,
+// and map_meta_cap's default branch is `$caps[] = $cap` with no name parsing
+// whatsoever. Core contradicts the shapes directly -- manage_categories and
+// manage_links belong to the editor role, delete_posts to the contributor role
+// -- and a capability a plugin registers through register_post_type's
+// capability_type is granted to nobody until the plugin grants it, which it
+// frequently does below Admin. events-manager, to take a measured case, grants
+// manage_bookings and delete_events to contributors and read_private_events to
+// subscribers, while the shapes called them Admin, Admin and Editor. Escalating
+// them makes an attacker-reachable endpoint read as gated.
+//
+// The floor is Subscriber, and that is exact rather than merely cautious: a
+// logged-out WP_User(0) holds no capability key at all except 'exist', so any
+// current_user_can() on a real capability requires a login.
+func resolveCapabilityForSubject(capability string, hasSubjectArg bool) (models.AuthLevel, bool) {
 	if capability == "" {
 		return 0, false
 	}
-	if level, ok := getCapabilityLevel(capability); ok {
-		return level, true
-	}
-	if level, ok := capabilityLevels[capability]; ok {
-		return level, true
-	}
-	if lvl := inferCapabilityAuthLevel(capability); lvl != models.Unauthenticated {
-		return lvl, true
-	}
-	// A capability nobody recognises still means a logged-in user.
-	return models.Subscriber, true
-}
+	initCapabilityLevels()
 
-// hasOnlyNonGatingCapabilityChecks reports that no capability check present
-// gates the whole body.
-//
-// GuardBranch counts as non-gating here, and that is the point. A check that
-// protects one branch leaves every other path into the function open, and the
-// level an endpoint requires is the level of its cheapest path. Only
-// GuardFunction -- fail the check and the request stops -- constrains the
-// endpoint as a whole.
-func hasOnlyNonGatingCapabilityChecks(code string) bool {
-	guards := FindCapabilityGuards(code)
-	if len(guards) == 0 {
-		return false
-	}
-	for _, g := range guards {
-		if g.Kind == GuardFunction {
-			return false
+	// An operator who has configured a capability explicitly outranks
+	// everything below, including core's own meta-capability mapping.
+	if authConfig != nil && authConfig.Capabilities != nil {
+		if lvl, ok := authConfig.Capabilities.Custom[capability]; ok {
+			return parseStringToAuthLevel(lvl), true
+		}
+		if lvl, ok := authConfig.Capabilities.ExtendedCapabilities[capability]; ok {
+			return parseStringToAuthLevel(lvl), true
 		}
 	}
-	return true
+
+	level, have := metaCapPrimitiveLevel(capability)
+	if !have {
+		if lvl, ok := getCapabilityLevel(capability); ok {
+			level, have = lvl, true
+		} else if lvl, ok := capabilityLevels[capability]; ok {
+			level, have = lvl, true
+		}
+	}
+	if !have {
+		level = models.Subscriber
+	}
+
+	if lvl, ok := metaCapFloorLevel(capability, hasSubjectArg); ok && lvl < level {
+		level = lvl
+	}
+	return level, true
+}
+
+// metaCapPrimitiveLevel is the level of the primitive capability map_meta_cap
+// substitutes for a meta capability, for the cases where core's switch body is
+// a literal `$caps[] = '<primitive>'` with no indirection and no branch on the
+// arguments.
+//
+// A meta capability is not a key in anyone's capability map. current_user_can()
+// runs it through map_meta_cap() first, and WP_User::has_cap() then tests the
+// PRIMITIVE capabilities that come back. Treating a meta capability as if it
+// were a primitive is how setup_network and upload_plugins came to read
+// SuperAdmin -- core maps them to manage_options and install_plugins on a
+// single-site install, which is Admin -- and how manage_post_tags read Admin,
+// when core maps it to manage_categories, an editor capability.
+//
+// This table sits ahead of the core capability list so it can correct that list
+// where the two disagree. Five entries do RAISE a level relative to the
+// Subscriber floor -- promote_user, remove_user, deactivate_plugin,
+// resume_plugin and resume_theme -- because core maps each to an
+// administrator-only primitive and nothing else in this file does. That is a
+// deliberate raise, recorded here so a reader of the diff is not surprised to
+// see privilege going up in a change whose purpose is to bring it down.
+func metaCapPrimitiveLevel(capability string) (models.AuthLevel, bool) {
+	lvl, ok := metaCapPrimitives[capability]
+	return lvl, ok
+}
+
+var metaCapPrimitives = map[string]models.AuthLevel{
+	// $caps[] = 'promote_users' / 'remove_users'
+	"promote_user": models.Admin,
+	"remove_user":  models.Admin,
+
+	// $caps[] = 'activate_plugins' / 'resume_plugins' / 'resume_themes'
+	"activate_plugin":   models.Admin,
+	"deactivate_plugin": models.Admin,
+	"resume_plugin":     models.Admin,
+	"resume_theme":      models.Admin,
+
+	// $caps[] = 'install_plugins' / 'install_themes' on a single site, which is
+	// Admin. Both were listed as SuperAdmin capabilities.
+	"upload_plugins": models.Admin,
+	"upload_themes":  models.Admin,
+
+	// setup_network resolves to manage_options unless the install is multisite.
+	"setup_network": models.Admin,
+
+	// $caps[] = 'update_core'
+	"update_php":   models.Admin,
+	"update_https": models.Admin,
+
+	// $caps[] = 'manage_categories', which core grants to the editor role.
+	"manage_post_tags":  models.Editor,
+	"edit_categories":   models.Editor,
+	"edit_post_tags":    models.Editor,
+	"delete_categories": models.Editor,
+	"delete_post_tags":  models.Editor,
+
+	// $caps[] = 'edit_posts', which core grants to the contributor role.
+	"assign_categories": models.Contributor,
+	"assign_post_tags":  models.Contributor,
+}
+
+// metaCapFloorLevel is the LOWEST primitive map_meta_cap can produce for a meta
+// capability whose mapping depends on something this analysis cannot see -- the
+// object the check names, or the capability map a register_post_type() or
+// register_taxonomy() call chose.
+//
+// It may only LOWER a level, never raise one, because the low end of that range
+// is what an attacker needs and the high end is a guess about a registration we
+// have not read.
+//
+// edit_user is the case that matters most, and it is exact rather than
+// conservative. map_meta_cap contains
+//
+//	if ( $user_id < 1 ) { $caps[] = 'do_not_allow'; break; }
+//	if ( 'edit_user' === $cap && isset( $args[0] ) && $user_id === (int) $args[0] ) { break; }
+//
+// -- it breaks with $caps still EMPTY for the self case, and WP_User::has_cap()
+// then runs `foreach ( (array) $caps as $cap )` over nothing and returns true.
+// So any logged-in user passes current_user_can('edit_user', $their_own_id),
+// while the same check with no object argument falls through to
+// $caps[] = 'edit_users' and really is Admin. The $user_id < 1 guard above it
+// is why the floor is Subscriber and not Unauthenticated.
+func metaCapFloorLevel(capability string, hasSubjectArg bool) (models.AuthLevel, bool) {
+	if hasSubjectArg {
+		if lvl, ok := metaCapWithObject[capability]; ok {
+			return lvl, true
+		}
+	}
+	lvl, ok := metaCapFloors[capability]
+	return lvl, ok
+}
+
+// metaCapWithObject holds the meta capabilities whose mapping breaks with an
+// empty capability set when the object named is the caller themselves.
+var metaCapWithObject = map[string]models.AuthLevel{
+	"edit_user": models.Subscriber,
+
+	// map_meta_cap( 'edit_user', $user_id, $args[0] ) for all of these.
+	"edit_user_meta":       models.Subscriber,
+	"add_user_meta":        models.Subscriber,
+	"delete_user_meta":     models.Subscriber,
+	"create_app_password":  models.Subscriber,
+	"list_app_passwords":   models.Subscriber,
+	"read_app_password":    models.Subscriber,
+	"edit_app_password":    models.Subscriber,
+	"delete_app_password":  models.Subscriber,
+	"delete_app_passwords": models.Subscriber,
+}
+
+// metaCapFloors holds the meta capabilities core routes through a post type's
+// or a taxonomy's own capability map. The value is the level of the DEFAULT
+// that register_post_type() and register_taxonomy() supply, which is the lowest
+// a caller can need; a registration is free to demand more, and registrations
+// are not read here.
+var metaCapFloors = map[string]models.AuthLevel{
+	// $tax->cap->assign_terms, whose register_taxonomy default is 'edit_posts'.
+	"assign_term": models.Contributor,
+
+	// map_meta_cap( 'edit_post', ... ) on the comment's post, floored by that
+	// post type's edit_posts.
+	"edit_comment": models.Contributor,
 }
