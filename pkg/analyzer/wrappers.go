@@ -97,25 +97,68 @@ var (
 		`\badd_filter\s*\(\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
 	)
 
-	// Patterns for wrappers that use concatenation: add_action('wp_ajax_' . $param, ...)
-	// These wrappers internally prepend the AJAX prefix
+	// Patterns for wrappers that build a hook name by concatenation:
+	// someCall('wp_ajax_' . $param, ...). Group 1 is the callee, group 2 the
+	// parameter carrying the action name.
+	//
+	// The callee is not required to be add_action. A string that begins
+	// "wp_ajax_" has exactly one meaning in WordPress -- it is the hook
+	// admin-ajax.php fires for that action -- so a function that builds one out
+	// of a parameter of its own is registering that action, whatever it hands
+	// the result to. Requiring the literal add_action meant a wrapper that
+	// delegated one further step registered nothing the analyzer could see; on a
+	// 143-plugin corpus 204 of these concatenations are handed to add_action and
+	// 2 to a plugin's own dispatcher, and those 2 were the entire AJAX surface
+	// of the plugin they belong to -- about twenty actions whose callbacks had
+	// no endpoint at all.
+	//
+	// The exceptions are in hookNonRegisteringCalls: core functions that take a
+	// hook name and do not attach a handler to it.
 	wrapperConcatAjaxPattern = regexp.MustCompile(
-		`\badd_action\s*\(\s*['"]wp_ajax_['"]\s*\.\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
+		`\b(` + phpIdentifier + `)\s*\(\s*['"]wp_ajax_['"]\s*\.\s*\$(` + phpIdentifier + `)`,
 	)
 	wrapperConcatAjaxNoprivPattern = regexp.MustCompile(
-		`\badd_action\s*\(\s*['"]wp_ajax_nopriv_['"]\s*\.\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
+		`\b(` + phpIdentifier + `)\s*\(\s*['"]wp_ajax_nopriv_['"]\s*\.\s*\$(` + phpIdentifier + `)`,
 	)
 	wrapperConcatAdminPostPattern = regexp.MustCompile(
-		`\badd_action\s*\(\s*['"]admin_post_['"]\s*\.\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
+		`\b(` + phpIdentifier + `)\s*\(\s*['"]admin_post_['"]\s*\.\s*\$(` + phpIdentifier + `)`,
 	)
 	wrapperConcatAdminPostNoprivPattern = regexp.MustCompile(
-		`\badd_action\s*\(\s*['"]admin_post_nopriv_['"]\s*\.\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
+		`\b(` + phpIdentifier + `)\s*\(\s*['"]admin_post_nopriv_['"]\s*\.\s*\$(` + phpIdentifier + `)`,
 	)
 	// Pattern for wc_ajax_ (WooCommerce AJAX) wrappers
 	wrapperConcatWcAjaxPattern = regexp.MustCompile(
-		`\badd_action\s*\(\s*['"]wc_ajax_['"]\s*\.\s*\$([a-zA-Z_][a-zA-Z0-9_]*)`,
+		`\b(` + phpIdentifier + `)\s*\(\s*['"]wc_ajax_['"]\s*\.\s*\$(` + phpIdentifier + `)`,
 	)
+
+	// hookNonRegisteringCalls are the core functions that take a hook name and do
+	// NOT attach a handler to it. A hook name built for one of these is being
+	// removed, fired or inspected, not registered, and reading it as a
+	// registration would invent an endpoint for an action the plugin is taking
+	// away. Measured on the corpus, remove_action accounts for 2 of the
+	// admin_post_ concatenations.
+	hookNonRegisteringCalls = map[string]bool{
+		"remove_action": true, "remove_all_actions": true,
+		"remove_filter": true, "remove_all_filters": true,
+		"has_action": true, "has_filter": true,
+		"did_action": true, "doing_action": true, "doing_filter": true,
+		"do_action": true, "do_action_ref_array": true,
+		"apply_filters": true, "apply_filters_ref_array": true,
+		"current_action": true, "current_filter": true,
+	}
 )
+
+// concatWrapperParam returns the parameter a concatenated hook name is built
+// from, for the first call in body that is actually registering a hook.
+func concatWrapperParam(pattern *regexp.Regexp, body string) string {
+	for _, m := range pattern.FindAllStringSubmatch(body, -1) {
+		if hookNonRegisteringCalls[m[1]] {
+			continue
+		}
+		return m[2]
+	}
+	return ""
+}
 
 // wrapperClassExtent is one class, trait or interface declaration together with
 // the region its body actually covers.
@@ -333,21 +376,23 @@ func findWrapperAddActionPattern(body string) (string, string) {
 	// First check for concatenation patterns (more specific)
 	// These are wrappers that internally add the AJAX prefix
 
-	// wp_ajax_nopriv_ must be checked before wp_ajax_ to avoid partial matches
-	if match := wrapperConcatAjaxNoprivPattern.FindStringSubmatch(body); match != nil {
-		return match[1], "wp_ajax_nopriv_"
+	// wp_ajax_nopriv_ must be checked before wp_ajax_ to avoid partial matches.
+	// The nopriv arm is also the answer to prefer when a body registers both,
+	// since the route is then reachable without logging in.
+	if p := concatWrapperParam(wrapperConcatAjaxNoprivPattern, body); p != "" {
+		return p, "wp_ajax_nopriv_"
 	}
-	if match := wrapperConcatAjaxPattern.FindStringSubmatch(body); match != nil {
-		return match[1], "wp_ajax_"
+	if p := concatWrapperParam(wrapperConcatAjaxPattern, body); p != "" {
+		return p, "wp_ajax_"
 	}
-	if match := wrapperConcatAdminPostNoprivPattern.FindStringSubmatch(body); match != nil {
-		return match[1], "admin_post_nopriv_"
+	if p := concatWrapperParam(wrapperConcatAdminPostNoprivPattern, body); p != "" {
+		return p, "admin_post_nopriv_"
 	}
-	if match := wrapperConcatAdminPostPattern.FindStringSubmatch(body); match != nil {
-		return match[1], "admin_post_"
+	if p := concatWrapperParam(wrapperConcatAdminPostPattern, body); p != "" {
+		return p, "admin_post_"
 	}
-	if match := wrapperConcatWcAjaxPattern.FindStringSubmatch(body); match != nil {
-		return match[1], "wc_ajax_"
+	if p := concatWrapperParam(wrapperConcatWcAjaxPattern, body); p != "" {
+		return p, "wc_ajax_"
 	}
 
 	// Check for generic variable patterns: add_action($hook, ...)
