@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/hatlesswizard/wptracelib/pkg/config"
@@ -1114,4 +1115,392 @@ func detectXMLRPCEndpoints(content, filepath string, pluginSlug string) []models
 	}
 
 	return endpoints
+}
+
+// --- Entry points driven by code outside the analysed tree ---
+
+// endpointTypeFramework labels an entry point whose caller is not in the tree.
+//
+// It is spelled here rather than added to pkg/models because that package is
+// not this change's to edit; the string is what every consumer reads either
+// way, and it is deliberately not "direct", which already means a PHP file
+// reachable by URL without the WordPress bootstrap.
+const endpointTypeFramework = models.EndpointType("framework")
+
+var (
+	// A class declaration together with the parent it names. Only the parent
+	// matters here; a class with no parent is completed by nothing outside the
+	// tree. PHP's identifier grammar has no case rule and permits a namespace
+	// path with or without a leading separator.
+	frameworkClassParentPattern = regexp.MustCompile(
+		`(?:\b(?:abstract|final|readonly)\s+)*\bclass\s+(` + phpIdentifier + `)\s+extends\s+(` + phpQualifiedName + `)`)
+
+	// Every declaration of a function or method, used both to enumerate a
+	// class's own methods and to know which names the tree declares at all.
+	frameworkDeclPattern = regexp.MustCompile(
+		`(?:(public|protected|private)\s+)?(?:(?:static|final|abstract)\s+)*function\s+(` + phpIdentifier + `)\s*\(`)
+
+	// A call that PHP resolves on the current object: inside a class body,
+	// these are the only spellings that can denote a method of that class.
+	frameworkSelfCallPattern = regexp.MustCompile(
+		`(?:\$this\s*->|self\s*::|static\s*::)\s*(` + phpIdentifier + `)\s*\(`)
+
+	// parent::m() denotes a method of an ANCESTOR, so it keeps that ancestor's
+	// method alive rather than the calling class's.
+	frameworkParentCallPattern = regexp.MustCompile(
+		`parent\s*::\s*(` + phpIdentifier + `)\s*\(`)
+
+	// [ $this, 'm' ] and array( $this, 'm' ): a method handed to something else
+	// to call. The receiver is required, because a bare 'm' string says nothing
+	// about which class it belongs to.
+	frameworkThisCallbackPattern = regexp.MustCompile(
+		`(?:\[|array\s*\()\s*(?:\$this|self::class|static::class|__CLASS__)\s*,\s*['"](` + phpIdentifier + `)['"]`)
+
+	// Name::m(, [ Name::class, 'm' ], array( 'Name', 'm' ): a call site that
+	// names the class explicitly, so it can be resolved without knowing where
+	// it appears.
+	frameworkStaticCallPattern = regexp.MustCompile(
+		`(` + phpIdentifier + `)\s*::\s*(` + phpIdentifier + `)\s*\(`)
+	frameworkClassCallbackPattern = regexp.MustCompile(
+		`(?:\[|array\s*\()\s*(?:['"](` + phpIdentifier + `)['"]|(` + phpIdentifier + `)\s*::\s*class)\s*,\s*['"](` + phpIdentifier + `)['"]`)
+
+	// A body that reaches nothing cannot make anything reachable.
+	frameworkIncludePattern   = regexp.MustCompile(`\b(?:include|require)(?:_once)?\b`)
+	frameworkCallTokenPattern = regexp.MustCompile(`\b(` + phpIdentifier + `)\s*\(`)
+)
+
+// frameworkMethod is one method declaration inside a class-like extent.
+type frameworkMethod struct {
+	name       string
+	visibility string
+	file       string
+	line       int
+	bodyStart  int
+	bodyEnd    int
+}
+
+// frameworkClass is what is known about one class declaration.
+type frameworkClass struct {
+	name      string
+	parent    string // last segment, lowercased; "" when the class extends nothing
+	file      string
+	methods   []frameworkMethod
+	selfRefs  map[string]bool // methods this body calls on $this / self / static
+	parentRef map[string]bool // methods this body calls via parent::
+}
+
+// DetectFrameworkEntryPoints reports the methods that only code outside the
+// analysed tree can be calling.
+//
+// Two facts about PHP, and nothing about any framework:
+//
+//   - A method body runs only when something calls it. If no call site anywhere
+//     in the analysed source can denote it, the caller is outside the analysed
+//     source.
+//   - A class that extends a name the analysed source does not declare is
+//     completed by code that is not here, and that code is what invokes the
+//     methods the class overrides.
+//
+// Together they say that a non-private method of a class whose inheritance
+// chain leaves the tree, which the tree never calls, is an entry point driven
+// by an external caller. That is true of a page-builder widget's render(), of a
+// WP_List_Table subclass's column_*(), of a WP_REST_Controller subclass and of
+// a payment gateway's process_payment() equally, and the rule names none of
+// them.
+//
+// Before this pass nothing modelled such a method as an entry point at all: the
+// widget detector keys on WP_Widget specifically, and no other detector treats
+// an uncalled method as a root. In a 143-plugin corpus, 42 trees declare a class
+// extending a *Widget_Base that is not WP_Widget and 47 declare a WP_List_Table
+// subclass -- and for the widget-heavy ones the product IS those classes, so the
+// analyzer reported a couple of dozen endpoints for a plugin whose entire
+// surface is several hundred widget files, and the vulnerable code was reachable
+// from nothing.
+//
+// The level is Unauthenticated, deliberately. Who drives an unknown external
+// framework is not knowable from the tree, and the bottom of the lattice is the
+// answer that can never hide a bug behind a privilege the code was never shown
+// to require. It costs exactness: a WP_List_Table's column_* methods really are
+// admin-only, and this pass will call them public.
+func DetectFrameworkEntryPoints(files map[string]string, pluginSlug string) []models.Endpoint {
+	classes, declaredNames := frameworkScan(files)
+	if len(classes) == 0 {
+		return nil
+	}
+
+	// PHP class names are case-insensitive, so every lookup is lowercased.
+	byName := make(map[string]*frameworkClass, len(classes))
+	for _, c := range classes {
+		if _, dup := byName[strings.ToLower(c.name)]; !dup {
+			byName[strings.ToLower(c.name)] = c
+		}
+	}
+	children := make(map[string][]*frameworkClass, len(classes))
+	for _, c := range classes {
+		if c.parent != "" {
+			children[c.parent] = append(children[c.parent], c)
+		}
+	}
+
+	staticPairs := frameworkStaticReferences(files)
+
+	out := make([]models.Endpoint, 0, 64)
+	for _, c := range classes {
+		if !frameworkManaged(c, byName) {
+			continue
+		}
+		// The call sites that can denote a method of c.
+		//
+		// $this->m() anywhere in c's inheritance closure can be c's m: PHP
+		// resolves it on the runtime object, so a base calling $this->m()
+		// reaches the most-derived implementation, and a subclass calling
+		// $this->m() reaches the one it inherited.
+		//
+		// parent::m() is different, and the difference matters. It denotes an
+		// ANCESTOR's m, never the calling class's own, so it may only suppress
+		// c when the call site is in a strict descendant. Counting it for the
+		// calling class too would delete exactly the entry point this pass
+		// exists to find: a subclass that overrides render() and opens with
+		// parent::render() is the commonest override shape there is, and it is
+		// the subclass's render that the framework calls.
+		related, descendants := frameworkClosure(c, byName, children)
+		called := make(map[string]bool)
+		for _, rel := range related {
+			for m := range rel.selfRefs {
+				called[m] = true
+			}
+		}
+		for _, d := range descendants {
+			for m := range d.parentRef {
+				called[m] = true
+			}
+		}
+
+		content := files[c.file]
+		lowerClass := strings.ToLower(c.name)
+		for _, m := range c.methods {
+			if m.visibility == "private" || strings.HasPrefix(m.name, "__") {
+				continue
+			}
+			if called[m.name] || staticPairs[lowerClass+"::"+strings.ToLower(m.name)] {
+				continue
+			}
+			if m.bodyEnd <= m.bodyStart || m.bodyEnd > len(content) {
+				continue
+			}
+			body := content[m.bodyStart:m.bodyEnd]
+			if !frameworkReachesCode(body, m.name, declaredNames) {
+				// A body that calls nothing the tree declares and includes no
+				// file cannot root a walk: an endpoint for it would widen the
+				// reported surface without widening what is examined.
+				continue
+			}
+			qualified := c.name + "::" + m.name
+			out = append(out, models.Endpoint{
+				PluginSlug: pluginSlug,
+				Type:       endpointTypeFramework,
+				Route:      "framework:" + qualified,
+				Method:     "GET",
+				AuthLevel:  models.Unauthenticated,
+				Callback:   qualified,
+				File:       c.file,
+				Line:       m.line,
+				RawCode:    "class " + c.name + " extends " + c.parent,
+			})
+		}
+	}
+	return out
+}
+
+// frameworkScan reads every file once and records the classes, their methods,
+// and the call sites that resolve on the current object.
+func frameworkScan(files map[string]string) ([]*frameworkClass, map[string]bool) {
+	classes := make([]*frameworkClass, 0, 64)
+	declaredNames := make(map[string]bool, 1024)
+
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		content := files[path]
+		if !strings.Contains(content, "class ") {
+			for _, d := range frameworkDeclPattern.FindAllStringSubmatch(content, -1) {
+				declaredNames[strings.ToLower(d[2])] = true
+			}
+			continue
+		}
+
+		parents := make(map[string]string)
+		for _, m := range frameworkClassParentPattern.FindAllStringSubmatch(content, -1) {
+			parent := m[2]
+			if i := strings.LastIndex(parent, "\\"); i >= 0 {
+				parent = parent[i+1:]
+			}
+			parents[strings.ToLower(m[1])] = strings.ToLower(parent)
+		}
+
+		extents := findWrapperClassExtents(content)
+		byExtent := make(map[string]*frameworkClass, len(extents))
+		for _, e := range extents {
+			c := &frameworkClass{
+				name:      e.name,
+				parent:    parents[strings.ToLower(e.name)],
+				file:      path,
+				selfRefs:  make(map[string]bool),
+				parentRef: make(map[string]bool),
+			}
+			body := content[e.open:e.end]
+			for _, s := range frameworkSelfCallPattern.FindAllStringSubmatch(body, -1) {
+				c.selfRefs[s[1]] = true
+			}
+			for _, s := range frameworkThisCallbackPattern.FindAllStringSubmatch(body, -1) {
+				c.selfRefs[s[1]] = true
+			}
+			for _, s := range frameworkParentCallPattern.FindAllStringSubmatch(body, -1) {
+				c.parentRef[s[1]] = true
+			}
+			byExtent[e.name] = c
+			classes = append(classes, c)
+		}
+
+		for _, d := range frameworkDeclPattern.FindAllStringSubmatchIndex(content, -1) {
+			name := content[d[4]:d[5]]
+			declaredNames[strings.ToLower(name)] = true
+
+			owner := classAt(extents, d[0])
+			if owner == "" {
+				continue
+			}
+			c := byExtent[owner]
+			if c == nil {
+				continue
+			}
+			open := declBodyOpen(content, d[1])
+			if open < 0 {
+				continue
+			}
+			end := matchBrace(content, open)
+			if end < 0 {
+				continue
+			}
+			visibility := ""
+			if d[2] >= 0 {
+				visibility = content[d[2]:d[3]]
+			}
+			c.methods = append(c.methods, frameworkMethod{
+				name:       name,
+				visibility: visibility,
+				file:       path,
+				line:       strings.Count(content[:d[0]], "\n") + 1,
+				bodyStart:  open,
+				bodyEnd:    end,
+			})
+		}
+	}
+	return classes, declaredNames
+}
+
+// frameworkStaticReferences collects every call site that names its class:
+// Name::method(, [ Name::class, 'method' ] and array( 'Name', 'method' ).
+func frameworkStaticReferences(files map[string]string) map[string]bool {
+	out := make(map[string]bool, 256)
+	for _, content := range files {
+		for _, m := range frameworkStaticCallPattern.FindAllStringSubmatch(content, -1) {
+			out[strings.ToLower(m[1])+"::"+strings.ToLower(m[2])] = true
+		}
+		for _, m := range frameworkClassCallbackPattern.FindAllStringSubmatch(content, -1) {
+			cls := m[1]
+			if cls == "" {
+				cls = m[2]
+			}
+			out[strings.ToLower(cls)+"::"+strings.ToLower(m[3])] = true
+		}
+	}
+	return out
+}
+
+// frameworkManaged reports whether c's inheritance chain terminates outside the
+// analysed tree.
+func frameworkManaged(c *frameworkClass, byName map[string]*frameworkClass) bool {
+	seen := make(map[string]bool, 4)
+	for cur := c; ; {
+		if cur.parent == "" {
+			return false
+		}
+		next, ok := byName[cur.parent]
+		if !ok {
+			return true
+		}
+		if seen[cur.parent] {
+			// A cycle cannot happen in valid PHP, but a name collision between
+			// two files can produce one; treat it as in-tree, which emits
+			// nothing.
+			return false
+		}
+		seen[cur.parent] = true
+		cur = next
+	}
+}
+
+// frameworkClosure returns c together with every in-tree class it inherits from
+// or that inherits from it -- the classes whose $this can denote a method of c
+// -- and separately the strict descendants, whose parent:: calls denote c's.
+func frameworkClosure(c *frameworkClass, byName map[string]*frameworkClass,
+	children map[string][]*frameworkClass) (related, descendants []*frameworkClass) {
+
+	related = []*frameworkClass{c}
+	seen := map[*frameworkClass]bool{c: true}
+
+	for cur := c; cur.parent != ""; {
+		next, ok := byName[cur.parent]
+		if !ok || seen[next] {
+			break
+		}
+		seen[next] = true
+		related = append(related, next)
+		cur = next
+	}
+
+	queue := []*frameworkClass{c}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, child := range children[strings.ToLower(cur.name)] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			related = append(related, child)
+			descendants = append(descendants, child)
+			queue = append(queue, child)
+		}
+	}
+	return related, descendants
+}
+
+// frameworkReachesCode reports whether a method body can root a walk: it
+// includes a file, or it calls a name the tree declares somewhere.
+func frameworkReachesCode(body, own string, declaredNames map[string]bool) bool {
+	if frameworkIncludePattern.MatchString(body) {
+		return true
+	}
+	// parent::m() is a call to a different declaration even when m is this
+	// method's own name -- that is what overriding means -- so it is not
+	// covered by the self-call exclusion below.
+	if frameworkParentCallPattern.MatchString(body) {
+		return true
+	}
+	for _, m := range frameworkCallTokenPattern.FindAllStringSubmatch(body, -1) {
+		name := strings.ToLower(m[1])
+		if name == strings.ToLower(own) {
+			continue
+		}
+		if declaredNames[name] {
+			return true
+		}
+	}
+	return false
 }

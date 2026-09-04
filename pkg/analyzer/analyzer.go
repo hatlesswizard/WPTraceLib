@@ -216,6 +216,15 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 	directEndpoints := DetectDirectPHPEndpointsWithAST(pluginDir, pluginSlug, astCtx)
 	analysis.Endpoints = append(analysis.Endpoints, directEndpoints...)
 
+	// PASS 3.45: Entry points driven by code outside the tree.
+	//
+	// This one is plugin-wide rather than per-file, because deciding that
+	// nothing calls a method means asking every file, and deciding that a class
+	// is completed from outside means following its parents across files.
+	frameworkEndpoints := DetectFrameworkEntryPoints(
+		relativeContentIndex(strippedContentCache, pluginDir), pluginSlug)
+	analysis.Endpoints = append(analysis.Endpoints, frameworkEndpoints...)
+
 	// PASS 3.5: Resolve dynamic action names via foreach-based cross-file data flow.
 	// Endpoints whose route contains {placeholder} are either expanded into concrete
 	// endpoints (when the foreach source can be traced) or annotated as
@@ -293,6 +302,21 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 	a.extractPluginMetadata(pluginDir, analysis)
 
 	return analysis, nil
+}
+
+// relativeContentIndex re-keys the stripped-content cache by plugin-relative
+// path, which is the form every endpoint's File carries. The contents are
+// shared, not copied.
+func relativeContentIndex(cache map[string]string, pluginDir string) map[string]string {
+	out := make(map[string]string, len(cache))
+	for path, content := range cache {
+		rel, err := makeRelativePath(path, pluginDir)
+		if err != nil {
+			rel = path
+		}
+		out[rel] = content
+	}
+	return out
 }
 
 // buildASTContext runs the full 7-layer AST pipeline for cross-file resolution.
