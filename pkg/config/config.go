@@ -64,6 +64,16 @@ type CapabilityConfig struct {
 	// These are always loaded and cannot be disabled.
 	CoreSubscriber []string `json:"core_subscriber,omitempty"`
 
+	// CoreUnauthenticated contains capabilities that a logged-out visitor passes,
+	// so a check on one of them gates nothing. WordPress has exactly one:
+	// WP_User::has_cap() sets $capabilities['exist'] = true unconditionally.
+	CoreUnauthenticated []string `json:"core_unauthenticated,omitempty"`
+
+	// index is the merged capability-to-level table built from the six core
+	// lists plus CoreUnauthenticated. It is unexported so encoding/json ignores
+	// it, is built lazily on first lookup, and is guarded by capIndexMu.
+	index *capabilityIndex
+
 	// ExtendedCapabilities maps additional capabilities to auth levels.
 	// Key is capability name, value is auth level string ("superadmin", "admin", "editor", "author", "contributor", "subscriber", "unauthenticated").
 	ExtendedCapabilities map[string]string `json:"extended_capabilities,omitempty"`
@@ -369,6 +379,12 @@ func (c *Config) mergeREST(other *RESTConfig) {
 
 // GetCapabilityLevel returns the auth level for a capability.
 // Returns the level and whether the capability was found.
+//
+// The core lists are consulted through one merged map rather than six sequential
+// scans. Scan order used to decide the answer for a capability that appeared in
+// two lists, and it decided it upward: edit_published_posts sat in both the
+// Editor and Author lists and Editor was scanned first, so a check an author
+// passes was reported as an editor gate. See CapabilityConfig.coreLevels.
 func (c *Config) GetCapabilityLevel(capability string) (models.AuthLevel, bool) {
 	if c.Capabilities == nil {
 		return models.Unauthenticated, false
@@ -388,46 +404,8 @@ func (c *Config) GetCapabilityLevel(capability string) (models.AuthLevel, bool) 
 		}
 	}
 
-	// Check core super admin
-	for _, cap := range c.Capabilities.CoreSuperAdmin {
-		if cap == capability {
-			return models.SuperAdmin, true
-		}
-	}
-
-	// Check core admin
-	for _, cap := range c.Capabilities.CoreAdmin {
-		if cap == capability {
-			return models.Admin, true
-		}
-	}
-
-	// Check core editor
-	for _, cap := range c.Capabilities.CoreEditor {
-		if cap == capability {
-			return models.Editor, true
-		}
-	}
-
-	// Check core author
-	for _, cap := range c.Capabilities.CoreAuthor {
-		if cap == capability {
-			return models.Author, true
-		}
-	}
-
-	// Check core contributor
-	for _, cap := range c.Capabilities.CoreContributor {
-		if cap == capability {
-			return models.Contributor, true
-		}
-	}
-
-	// Check core subscriber
-	for _, cap := range c.Capabilities.CoreSubscriber {
-		if cap == capability {
-			return models.Subscriber, true
-		}
+	if level, ok := c.Capabilities.coreLevels()[capability]; ok {
+		return level, true
 	}
 
 	return models.Unauthenticated, false
