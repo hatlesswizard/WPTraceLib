@@ -2,8 +2,10 @@ package ast
 
 import (
 	"strings"
+	"sync"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	"github.com/hatlesswizard/wptracelib/pkg/config"
 	"github.com/hatlesswizard/wptracelib/pkg/models"
 )
 
@@ -63,77 +65,44 @@ var superglobals = map[string]string{
 	"$_FILES":   "FILES",
 }
 
-var capabilityMap = map[string]models.AuthLevel{
-	"read":                  models.Subscriber,
-	"exist":                 models.Subscriber,
-	"level_0":               models.Subscriber,
-	"read_post":             models.Subscriber,
-	"read_page":             models.Subscriber,
-	"edit_posts":            models.Contributor,
-	"delete_posts":          models.Contributor,
-	"edit_post":             models.Contributor,
-	"delete_post":           models.Contributor,
-	"publish_posts":         models.Author,
-	"upload_files":          models.Author,
-	"publish_post":          models.Author,
-	"edit_published_posts":  models.Author,
-	"delete_published_posts": models.Author,
-	"edit_others_posts":     models.Editor,
-	"moderate_comments":     models.Editor,
-	"manage_categories":     models.Editor,
-	"edit_pages":            models.Editor,
-	"edit_page":             models.Editor,
-	"delete_page":           models.Editor,
-	"publish_page":          models.Editor,
-	"edit_others_pages":     models.Editor,
-	"delete_others_posts":   models.Editor,
-	"delete_others_pages":   models.Editor,
-	"edit_published_pages":  models.Editor,
-	"delete_published_pages": models.Editor,
-	"publish_pages":         models.Editor,
-	"manage_links":          models.Editor,
-	"edit_term":             models.Editor,
-	"delete_term":           models.Editor,
-	"assign_term":           models.Editor,
-	"manage_options":        models.Admin,
-	"activate_plugins":      models.Admin,
-	"install_plugins":       models.Admin,
-	"delete_plugins":        models.Admin,
-	"update_plugins":        models.Admin,
-	"edit_plugins":          models.Admin,
-	"edit_theme_options":    models.Admin,
-	"install_themes":        models.Admin,
-	"update_themes":         models.Admin,
-	"switch_themes":         models.Admin,
-	"delete_themes":         models.Admin,
-	"edit_themes":           models.Admin,
-	"update_core":           models.Admin,
-	"edit_users":            models.Admin,
-	"delete_users":          models.Admin,
-	"create_users":          models.Admin,
-	"list_users":            models.Admin,
-	"promote_users":         models.Admin,
-	"remove_users":          models.Admin,
-	"unfiltered_html":       models.Admin,
-	"import":                models.Admin,
-	"export":                models.Admin,
-	"administrator":         models.Admin,
-	"customize":             models.Admin,
-	"edit_dashboard":        models.Admin,
-	"edit_files":            models.Admin,
-	"edit_user":             models.Admin,
-	"delete_user":           models.Admin,
-	"manage_privacy_options": models.Admin,
-	"manage_network":        models.SuperAdmin,
-	"manage_sites":          models.SuperAdmin,
-	"manage_network_users":  models.SuperAdmin,
-	"manage_network_plugins": models.SuperAdmin,
-	"manage_network_themes": models.SuperAdmin,
-	"manage_network_options": models.SuperAdmin,
-	"setup_network":         models.SuperAdmin,
-	"upgrade_network":       models.SuperAdmin,
-	"upload_plugins":        models.SuperAdmin,
-	"upload_themes":         models.SuperAdmin,
+// capabilityConfig is the capability table this package resolves a
+// current_user_can() argument against.
+//
+// It used to be a second copy of the table in pkg/config, declared here as a
+// package-level map. The two disagreed -- edit_pages was Editor here and absent
+// there, edit_published_posts and delete_published_posts were Author here and
+// Editor there -- so a capability correction in pkg/config silently did not
+// apply on this path, and an embedder's SetAuthConfig could not reach it at all.
+// pkg/config imports nothing from this package, so reading the one table
+// directly is both possible and the smallest fix.
+var (
+	capabilityConfigMu sync.RWMutex
+	capabilityConfig   *config.Config
+)
+
+// defaultCapabilityConfig builds the stock WordPress table once. config.New()
+// allocates the whole configuration, so it is not something to call per lookup.
+var defaultCapabilityConfig = sync.OnceValue(config.New)
+
+// SetCapabilityConfig points this package at a caller-supplied capability
+// table. Passing nil restores the WordPress core defaults.
+func SetCapabilityConfig(cfg *config.Config) {
+	capabilityConfigMu.Lock()
+	capabilityConfig = cfg
+	capabilityConfigMu.Unlock()
+}
+
+// capabilityLevel resolves a capability name to the lowest core role that holds
+// it, exactly as pkg/config does for every other code path.
+func capabilityLevel(capability string) (models.AuthLevel, bool) {
+	capabilityConfigMu.RLock()
+	cfg := capabilityConfig
+	capabilityConfigMu.RUnlock()
+
+	if cfg == nil {
+		cfg = defaultCapabilityConfig()
+	}
+	return cfg.GetCapabilityLevel(capability)
 }
 
 // BuildCallGraph walks every function/method body in the symbol table, finds
@@ -545,15 +514,42 @@ func (a *AuthAnalyzer) findAuthGuard(node *sitter.Node, source []byte) (bool, mo
 	}
 
 	var found bool
-	var highestLevel models.AuthLevel
+	var weakestLevel models.AuthLevel
 
-	walkForAuthGuards(node, source, &found, &highestLevel)
-	return found, highestLevel
+	walkForAuthGuards(node, source, &found, &weakestLevel)
+	return found, weakestLevel
 }
 
+// walkForAuthGuards records the WEAKEST authorization check anywhere in a body.
+//
+// It used to record the strongest, and that is unsound here, because this walker
+// has no gating analysis at all: it descends the whole body and reports every
+// current_user_can() it finds, whether failing that check stops the request,
+// decides one branch of an if, or merely lands in a variable. A handler with an
+// admin-only branch beside an unguarded vulnerable branch therefore reported
+// Admin -- a reachable vulnerability that looks gated, which is exactly the
+// defect the guard classifier in pkg/analyzer was written to remove.
+//
+// The minimum is not the semantic requirement in every case, and it is worth
+// being honest about that: two checks in sequence that each end the request on
+// failure are conjunctive, and there the caller genuinely needs the stronger of
+// the two. What the minimum buys is the direction of the error. Reporting too
+// little privilege is noise; reporting too much hides a real bug. Until this
+// walker can tell a check that gates the function from a check that gates a
+// branch, the weakest check found is the honest floor -- the same reasoning
+// StrongestGuard applies in pkg/analyzer to checks that gate a whole function.
 func walkForAuthGuards(node *sitter.Node, source []byte, found *bool, level *models.AuthLevel) {
 	if node == nil {
 		return
+	}
+
+	// record keeps the minimum, treating the first check found as the seed so
+	// that the zero value of *level (Unauthenticated) is never mistaken for one.
+	record := func(authLevel models.AuthLevel) {
+		if !*found || authLevel < *level {
+			*level = authLevel
+		}
+		*found = true
 	}
 
 	if node.Type() == "function_call_expression" {
@@ -568,44 +564,44 @@ func walkForAuthGuards(node *sitter.Node, source []byte, found *bool, level *mod
 					capArg := args.NamedChild(0)
 					capStr := extractCapabilityString(capArg, source)
 					if capStr != "" {
-						authLevel, ok := capabilityMap[capStr]
+						authLevel, ok := capabilityLevel(capStr)
 						if !ok {
+							// A capability this table does not know is still a
+							// capability, and WordPress grants no capability at
+							// all to a logged-out visitor, so Subscriber is the
+							// floor for one it cannot name.
 							authLevel = models.Subscriber
 						}
-						*found = true
-						if authLevel > *level {
-							*level = authLevel
-						}
+						record(authLevel)
 						return
 					}
 				}
-				*found = true
-				if models.Subscriber > *level {
-					*level = models.Subscriber
-				}
+				record(models.Subscriber)
 				return
 
 			case "is_user_logged_in":
-				*found = true
-				if models.Subscriber > *level {
-					*level = models.Subscriber
-				}
-				return
-
-			case "get_current_user_id":
-				*found = true
-				if models.Subscriber > *level {
-					*level = models.Subscriber
-				}
-				return
-
-			case "wp_get_current_user":
-				*found = true
-				if models.Subscriber > *level {
-					*level = models.Subscriber
-				}
+				// A predicate that exists only to be tested, and what it tests
+				// is the caller's login state. Its presence is still not proof
+				// that the body is gated on it -- that needs the control-flow
+				// analysis this walker does not have -- so a body that merely
+				// branches on login state can still read Subscriber. Under the
+				// minimum rule it can at least no longer raise a body above a
+				// capability check sitting beside it.
+				record(models.Subscriber)
 				return
 			}
+
+			// get_current_user_id() and wp_get_current_user() used to be counted
+			// here as guards worth Subscriber. They are not guards: both return a
+			// value and neither denies anything. wp_get_current_user() is how
+			// every plugin READS the caller -- it hands a logged-out visitor a
+			// WP_User(0) rather than refusing -- and get_current_user_id()
+			// returns 0 for that same visitor. Counting them promoted any handler
+			// that merely looked up who was calling:
+			//
+			//     function h() { $u = wp_get_current_user(); update_option( $_POST['k'], $_POST['v'] ); }
+			//
+			// Truth: unauthenticated. Reported before this change: subscriber.
 		}
 	}
 
@@ -778,7 +774,7 @@ func analyzeReturnExpression(expr *sitter.Node, source []byte, aa *AuthAnalyzer,
 			if args != nil && args.NamedChildCount() > 0 {
 				capStr := extractCapabilityString(args.NamedChild(0), source)
 				if capStr != "" {
-					if level, ok := capabilityMap[capStr]; ok {
+					if level, ok := capabilityLevel(capStr); ok {
 						return level
 					}
 					return models.Subscriber
