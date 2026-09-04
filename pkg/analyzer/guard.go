@@ -137,6 +137,10 @@ const (
 	GuardNone GuardKind = iota
 	// GuardBranch: the check gates one branch, but control continues past it.
 	GuardBranch
+	// GuardAlternative: failing the check ends the function, but the same
+	// condition offers another way past that this analysis cannot resolve. The
+	// body is gated; the level this check names is not what it costs.
+	GuardAlternative
 	// GuardFunction: failing the check ends the function, so every statement
 	// after it is reached only by a caller who passed.
 	GuardFunction
@@ -290,6 +294,14 @@ func findAuthChecks(body, mask string) []authCheckSite {
 		if strings.TrimSpace(mask[parenOpen+1:parenClose]) != "" {
 			continue
 		}
+		// And the call has to BE a test, not feed one. In
+		// `if ( ! llms_is_user_enrolled( get_current_user_id(), $post->ID ) )`
+		// the gate is llms_is_user_enrolled(); get_current_user_id() is one of
+		// its arguments and says nothing on its own, because the enclosing
+		// function is free to answer true for user 0.
+		if isCallArgument(mask, callStart) {
+			continue
+		}
 		g := CapabilityGuard{Offset: callStart, IsIdentity: true}
 		switch fn {
 		case "is_super_admin":
@@ -337,6 +349,34 @@ func findAuthChecks(body, mask string) []authCheckSite {
 
 	sortSitesByOffset(out)
 	return out
+}
+
+// isCallArgument reports whether pos sits inside the argument list of another
+// call, rather than standing as a value of its own.
+func isCallArgument(mask string, pos int) bool {
+	depth := 0
+	for i := pos - 1; i >= 0; i-- {
+		switch mask[i] {
+		case ')':
+			depth++
+		case '(':
+			if depth == 0 {
+				// A paren opened by an identifier is a call; one opened by a
+				// control-flow keyword, by `!` or `&&`, or by nothing, is
+				// grouping.
+				switch identifierBefore(mask, i) {
+				case "", "if", "elseif", "else", "while", "for", "foreach",
+					"switch", "return", "and", "or", "xor":
+					return false
+				}
+				return true
+			}
+			depth--
+		case ';', '{', '}':
+			return false
+		}
+	}
+	return false
 }
 
 func sortSitesByOffset(sites []authCheckSite) {
@@ -501,6 +541,9 @@ func classifyCheck(mask string, decls []FuncDecl, callStart, parenClose int, sco
 			// made the old presence-based inference report Admin for an
 			// unguarded sink.
 			return GuardBranch
+		}
+		if hasAlternativeWayIn(mask, condOpen, condClose, callStart) {
+			return GuardAlternative
 		}
 		return GuardFunction
 	}
@@ -856,6 +899,71 @@ func hasWordAt(s string, i int, word string) bool {
 	return i+len(word) == len(s) || !isTypeChar(s[i+len(word)])
 }
 
+// hasAlternativeWayIn reports whether the refusing condition offers a route past
+// it that this analysis cannot resolve.
+//
+// `if ( COND ) { refuse; }` lets a caller through exactly when COND is false.
+// Written as a conjunction, COND = C1 && C2 && ... , so !COND is
+// !C1 || !C2 || ... -- a set of ALTERNATIVES, one per conjunct. The capability
+// check sits in one of them; every other conjunct is a separate way in.
+// Measured on a real template:
+//
+//	if ( ! current_user_can( 'manage_options' ) && ! $is_instructor ) {
+//	    ... return;
+//	}
+//
+// A course instructor gets in without manage_options, so reporting Admin here
+// over-restricts by however far an instructor sits below an administrator. A
+// conjunct that is itself an authorization check is fine -- it produces its own
+// guard and the caller already takes the minimum over them, which is the same
+// answer -- and this is why `if ( ! current_user_can('a') && ! current_user_can('b') )`
+// still resolves.
+//
+// Conjuncts joined by `||` are the opposite case and are not alternatives:
+// `if ( ! can || ! nonce ) { die; }` lets a caller through only when both hold.
+func hasAlternativeWayIn(mask string, condOpen, condClose, callStart int) bool {
+	cond := mask[condOpen+1 : condClose]
+	if strings.Contains(cond, "||") {
+		// A disjunction of refusals is a conjunction of requirements; nothing
+		// here is an alternative.
+		return false
+	}
+	base := condOpen + 1
+	depth := 0
+	start := 0
+	var spans [][2]int
+	for i := 0; i+1 <= len(cond); i++ {
+		switch cond[i] {
+		case '(', '[':
+			depth++
+			continue
+		case ')', ']':
+			depth--
+			continue
+		}
+		if depth == 0 && i+1 < len(cond) && cond[i] == '&' && cond[i+1] == '&' {
+			spans = append(spans, [2]int{start, i})
+			start = i + 2
+			i++
+		}
+	}
+	spans = append(spans, [2]int{start, len(cond)})
+	if len(spans) < 2 {
+		return false
+	}
+	for _, s := range spans {
+		if base+s[0] <= callStart && callStart < base+s[1] {
+			continue // the conjunct holding our own check
+		}
+		operand := cond[s[0]:s[1]]
+		if capCheckPattern.MatchString(operand) || identityCheckPattern.MatchString(operand) {
+			continue // another authorization check, which speaks for itself
+		}
+		return true
+	}
+	return false
+}
+
 // nothingExecutesBefore reports whether the guard is the first statement of the
 // body it sits in. A positive guard preceded by executable code cannot protect
 // that code, and reporting the function as gated hides it:
@@ -939,11 +1047,11 @@ func StrongestGuard(body string) (caps []string, gated bool) {
 		return nil, false
 	}
 	for _, g := range guards {
-		if g.Kind != GuardFunction || g.IsIdentity {
+		if g.IsIdentity || (g.Kind != GuardFunction && g.Kind != GuardAlternative) {
 			continue
 		}
 		gated = true
-		if g.Capability != "" {
+		if g.Kind == GuardFunction && g.Capability != "" {
 			caps = append(caps, g.Capability)
 		}
 	}
