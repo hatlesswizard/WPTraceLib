@@ -215,8 +215,9 @@ func analyzeDirectPHPFile(path, pluginDir, pluginSlug string) *models.Endpoint {
 
 	// There is deliberately no rejection here for a file that declares a class
 	// or a function and executes nothing at top level, although such a file
-	// genuinely runs nothing when it is requested, and 392 of the 618 direct
-	// endpoints this pass emitted across the corpus are of that shape.
+	// genuinely runs nothing when it is requested. It is not a rare shape: 392
+	// of the 618 endpoints this pass used to emit across the corpus were of it,
+	// and 1,242 of the 2,334 it emits now, in 92 of 143 plugins.
 	//
 	// The reason is the priority order this library is tuned to. A spurious
 	// direct endpoint is reported Unauthenticated, so it can only ever pull a
