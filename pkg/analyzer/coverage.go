@@ -3,6 +3,7 @@ package analyzer
 import (
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/hatlesswizard/wptracelib/pkg/models"
@@ -22,12 +23,27 @@ func AuditRESTCoverage(pluginDir string, endpoints []models.Endpoint, strippedCa
 	}
 	detected := make(map[fileLine]bool)
 	for _, ep := range endpoints {
+		// Only handler endpoints. A permission-callback endpoint carries its
+		// callback's DECLARATION line, not the registration line, so counting it
+		// here would let a declaration that happens to sit within the audit's
+		// three-line tolerance of an unparsed register_rest_route call mask a
+		// real gap.
 		if ep.Type != models.EndpointTypeREST {
 			continue
 		}
 		report.DetectedEndpoints++
+		// An endpoint's File comes from makeRelativePath, i.e. filepath.Rel, so on
+		// Windows it carries backslashes ("src\Controllers\Routes.php") while the
+		// scan below builds its key with filepath.ToSlash. Comparing the two forms
+		// directly meant every endpoint in a SUBDIRECTORY failed to match its own
+		// register_rest_route call and was reported as a gap. Measured before this
+		// line was added: suretriggers 1.0.78 reported "10 route calls -> 10
+		// endpoints, 10 gaps", listing as uncovered the ten calls whose endpoints it
+		// had just printed, and lifterlms 9.1.0 reported all 9 of its calls as gaps.
+		// Both lists were 100% false positives. Normalise both sides.
+		file := filepath.ToSlash(ep.File)
 		for delta := -3; delta <= 3; delta++ {
-			detected[fileLine{file: ep.File, line: ep.Line + delta}] = true
+			detected[fileLine{file: file, line: ep.Line + delta}] = true
 		}
 	}
 
@@ -85,6 +101,16 @@ func AuditRESTCoverage(pluginDir string, endpoints []models.Endpoint, strippedCa
 			})
 		}
 	}
+
+	// strippedCache is a map, so the scan above visits files in a random order and
+	// the gap list came out in a different order on every run. A report that is
+	// read by a human or diffed between two runs has to be stable, so sort it.
+	sort.Slice(report.Gaps, func(i, j int) bool {
+		if report.Gaps[i].File != report.Gaps[j].File {
+			return report.Gaps[i].File < report.Gaps[j].File
+		}
+		return report.Gaps[i].Line < report.Gaps[j].Line
+	})
 
 	return report
 }
