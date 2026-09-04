@@ -343,3 +343,16 @@ func TestDirectHtmlInterleavedFileIsAnEndpoint(t *testing.T) {
 		t.Fatalf("want 1 endpoint, got %d: %v", len(eps), slashRoutes(eps))
 	}
 }
+
+// The bound on widening the read window. Reading the whole file finds request
+// data wherever it sits, but a file that opens with a bootstrap guard is still
+// unreachable however far down that data appears -- the guard runs first and the
+// file exits.
+func TestDirectGuardStillRejectsAcrossTheWholeFile(t *testing.T) {
+	body := "<?php\nif ( ! defined( 'ABSPATH' ) ) { exit; }\n" +
+		strings.Repeat("$noop = 1;\n", 400) + "echo $_GET['q'];\n"
+	root := writeTree(t, map[string]string{"a.php": body})
+	if eps := DetectDirectPHPEndpoints(root, "p"); len(eps) != 0 {
+		t.Fatalf("want no endpoint, got %v", slashRoutes(eps))
+	}
+}
