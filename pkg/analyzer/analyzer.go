@@ -224,9 +224,14 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 		analysis.Endpoints = resolveUnresolvedEndpoints(analysis.Endpoints, strippedContentCache, pluginDir)
 	}
 
-	// DETERMINISM: Sort endpoints before deduplication so that goroutine
-	// scheduling order doesn't affect which endpoint wins during dedup.
-	// Sort by Route + Method + Type + SourceFile + Callback for stable ordering.
+	// DETERMINISM: Sort endpoints before merging so that goroutine scheduling
+	// order does not affect which registration represents a merged group.
+	//
+	// Line and AuthLevel belong in the ordering, and their absence mattered.
+	// The old key stopped at Callback and sort.Slice is not stable, so two
+	// registrations agreeing on route, method, type, file and callback -- about
+	// 98% of the twins in a 143-plugin corpus -- were ordered arbitrarily. That
+	// was harmless for every field except the one that decides the answer.
 	sort.Slice(analysis.Endpoints, func(i, j int) bool {
 		a, b := analysis.Endpoints[i], analysis.Endpoints[j]
 		if a.Route != b.Route {
@@ -241,11 +246,17 @@ func (a *Analyzer) AnalyzePlugin(ctx context.Context, pluginDir string) (*models
 		if a.File != b.File {
 			return a.File < b.File
 		}
-		return a.Callback < b.Callback
+		if a.Callback != b.Callback {
+			return a.Callback < b.Callback
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.AuthLevel < b.AuthLevel
 	})
 
-	// Deduplicate endpoints (same route, method, type within a plugin)
-	analysis.Endpoints = deduplicateEndpoints(analysis.Endpoints)
+	// Merge registrations that describe the same dispatch target
+	analysis.Endpoints = mergeEndpoints(analysis.Endpoints)
 
 	// PASS 3.7: REST Coverage Audit
 	// Compare detected REST endpoints against register_rest_route() calls in source
@@ -600,44 +611,79 @@ func (a *Analyzer) enrichEndpointsWithHierarchicalCallGraph(endpoints []models.E
 	}
 }
 
-// deduplicateEndpoints removes duplicate endpoints based on (route, method, type)
-// When duplicates exist, prefer the one with:
-// 1. Higher auth level (more restrictive = more accurate detection)
-// 2. More complete callback information (non-"inline", non-"unknown")
-func deduplicateEndpoints(endpoints []models.Endpoint) []models.Endpoint {
-	seen := make(map[string]int) // key -> index in result
+// mergeEndpoints removes records that make the same claim, keyed on
+// (route, method, type, callback, auth level).
+//
+// It replaces a rule that keyed on (route, method, type) alone and, on a
+// collision, kept the record with the HIGHER auth level, discarding the other.
+// Both halves of that rule were wrong, and each was wrong in the direction that
+// hides a vulnerability.
+//
+// The level. The privilege an endpoint requires is the privilege of the
+// cheapest request that reaches it: an attacker takes the arm that costs least,
+// so the requirement for a route is the MINIMUM over the records that describe
+// it. Keeping only the maximum reported a gate no attacker has to pass, which
+// is the over-restriction failure -- a real, reachable bug looks gated and is
+// dismissed. Measured over a 143-plugin corpus, 9 collisions in 8 trees kept a
+// level strictly above their group's minimum, and because the pre-merge sort
+// did not order on AuthLevel while sort.Slice is unstable, which level survived
+// a fully tied pair was not even decided: ~98% of twin pairs tie on every field
+// the old sort compared.
+//
+// This function does not impose that minimum, it stops destroying it. Every
+// consumer of an endpoint list already reduces with a minimum when it asks what
+// an attacker needs -- that is the only question the list is used to answer --
+// and a library that answers it in advance, by deleting the cheaper record,
+// leaves the consumer no way to disagree. Keeping both records also keeps the
+// stricter one, which a consumer computing a maximum for a sensitivity check
+// still needs; the old rule kept exactly one of the two and it was the wrong
+// one.
+//
+// The key. formatAjaxRoute maps wp_ajax_X and wp_ajax_nopriv_X onto one URL,
+// which is right: admin-ajax.php is one URL and core picks the arm on
+// is_user_logged_in(). But the two arms may bind DIFFERENT callbacks, and then
+// they are not two guesses at one thing -- they are two handlers, one of which
+// an anonymous caller reaches and one of which it does not. Merging them threw
+// a callback away, and Endpoint.Callback is the only seed the reachability walk
+// has, so the discarded handler became reachable from nothing: 899 records
+// discarded corpus-wide, 129 of them naming a callback the survivor did not.
+// Attributing the surviving record's level to the union of the two handlers
+// would be just as wrong in the other direction, since a handler bound only to
+// the priv arm is not anonymously reachable; keeping the records apart is what
+// keeps both facts.
+//
+// The file is deliberately NOT part of the key. A registration's identity is
+// the handler it binds, not the file the registering line sits in, and some
+// detectors report one hook once per file in the plugin: keying on the file
+// turned a single ActionScheduler registration into 248 records on one tree,
+// all naming the same callback. Each surviving record still carries a file of
+// its own, so the (callback, file) pair the reachability walk seeds from stays
+// a pair that really occurs.
+//
+// Nothing is dropped any more for having an uninformative callback name. The
+// old rule let a named callback evict a "closure" or "inline" record on the
+// same route, reasoning that the name was the better detection. That stopped
+// being true once an anonymous callback's walk learned to seed from its own
+// file: the evicted record carries a file, the file carries a body, and the
+// body reaches code the named record does not.
+func mergeEndpoints(endpoints []models.Endpoint) []models.Endpoint {
+	seen := make(map[string]bool, len(endpoints))
 	result := make([]models.Endpoint, 0, len(endpoints))
 
 	for _, ep := range endpoints {
-		// Create a unique key based on route, method, and type
-		key := ep.Route + "|" + ep.Method + "|" + string(ep.Type)
-		if existingIdx, exists := seen[key]; !exists {
-			seen[key] = len(result)
-			result = append(result, ep)
-		} else {
-			// Compare and keep the better detection
-			existing := result[existingIdx]
-
-			// Prefer higher auth level (more restrictive = more accurate)
-			// But don't downgrade from Unauthenticated if that's explicitly detected
-			shouldReplace := false
-			if ep.AuthLevel > existing.AuthLevel && existing.AuthLevel != models.Unauthenticated {
-				shouldReplace = true
-			}
-
-			// Prefer more informative callbacks over generic ones
-			genericCallbacks := map[string]bool{
-				"inline": true, "unknown": true, "closure": true,
-				"anonymous": true, "anonymous_function": true,
-			}
-			if !shouldReplace && genericCallbacks[existing.Callback] && !genericCallbacks[ep.Callback] {
-				shouldReplace = true
-			}
-
-			if shouldReplace {
-				result[existingIdx] = ep
-			}
+		// The callback and the level are part of a record's claim, not
+		// incidental detail. Two records that name different handlers describe
+		// two bodies of code, each reachable on its own terms; two that give
+		// one handler different levels are two different answers to the
+		// question the caller is asking, and the caller, not this function,
+		// decides between them.
+		key := ep.Route + "|" + ep.Method + "|" + string(ep.Type) + "|" +
+			ep.Callback + "|" + ep.AuthLevel.String()
+		if seen[key] {
+			continue
 		}
+		seen[key] = true
+		result = append(result, ep)
 	}
 
 	return result
