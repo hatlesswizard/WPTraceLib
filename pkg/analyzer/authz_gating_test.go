@@ -379,6 +379,59 @@ func TestNegationParityIsPerOperand(t *testing.T) {
 	})
 }
 
+// TestAnotherWayPastTheGuardMakesItUnresolvable. `if ( COND ) { refuse; }` lets
+// a caller through exactly when COND is false, and a conjunction's negation is a
+// set of alternatives -- one per conjunct. A conjunct we cannot resolve is a
+// route in that we cannot price.
+func TestAnotherWayPastTheGuardMakesItUnresolvable(t *testing.T) {
+	runLevelCases(t, []levelCase{
+		{
+			// A course instructor gets in without manage_options.
+			"unresolvable alternative",
+			`{ if ( ! current_user_can('manage_options') && ! $is_instructor ) { render_denied(); return; } show( $_GET['id'] ); }`,
+			models.Subscriber,
+		},
+		{
+			"request-controlled alternative",
+			`{ if ( ! isset($_POST['id']) && ! current_user_can('manage_options') ) { wp_die(); } sink($_POST['x']); }`,
+			models.Subscriber,
+		},
+		// Bound 1: another authorization check is not an unresolvable
+		// alternative -- it speaks for itself, and the minimum over the two is
+		// the same answer.
+		{
+			"two capability alternatives",
+			`{ if ( ! current_user_can('manage_options') && ! current_user_can('edit_posts') ) { wp_die(); } sink($_POST['x']); }`,
+			models.Contributor,
+		},
+		// Bound 2: conjuncts joined by || are requirements, not alternatives.
+		// `if ( ! can || ! nonce ) { die; }` admits only a caller with both.
+		{
+			"disjunction of refusals",
+			`{ if ( ! current_user_can('manage_options') || ! wp_verify_nonce($_POST['n'],'a') ) { wp_die(); } sink($_POST['x']); }`,
+			models.Admin,
+		},
+		// Bound 3: a lone negated check is unaffected.
+		{
+			"single conjunct",
+			`{ if ( ! current_user_can('manage_options') ) { wp_die(); } sink($_POST['x']); }`,
+			models.Admin,
+		},
+	})
+}
+
+// TestIdentityPredicateMustBeATestNotAnArgument. In
+// `if ( ! plugin_is_enrolled( get_current_user_id(), $id ) )` the gate is
+// plugin_is_enrolled(); get_current_user_id() is one of its arguments, and the
+// enclosing function is free to answer true for user 0.
+func TestIdentityPredicateMustBeATestNotAnArgument(t *testing.T) {
+	runLevelCases(t, []levelCase{
+		{"identity fed to another call", `{ if ( ! some_plugin_is_enrolled( get_current_user_id(), $post->ID ) ) { return; } echo $_GET['x']; }`, models.Unauthenticated},
+		// The bound: the same predicate as the test itself still gates.
+		{"identity as the test", `{ if ( ! get_current_user_id() ) { wp_die(); } echo $_GET['x']; }`, models.Subscriber},
+	})
+}
+
 // TestAssignedThenTestedIsAGuard: `$v = expr; if ( ! $v ) { terminate; }` has
 // the same control flow as the inline form; only a temporary got in the way.
 func TestAssignedThenTestedIsAGuard(t *testing.T) {

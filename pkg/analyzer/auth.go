@@ -363,16 +363,23 @@ func gatedAuthLevel(code string, fileContent string, scope BodyScope) (models.Au
 	loginBest := models.AuthLevel(-1)
 
 	for _, g := range guards {
-		if g.Kind != GuardFunction {
+		if g.Kind != GuardFunction && g.Kind != GuardAlternative {
 			continue
 		}
 		if g.IsIdentity {
-			if loginBest < 0 || g.Implied < loginBest {
-				loginBest = g.Implied
+			if g.Kind == GuardFunction {
+				if loginBest < 0 || g.Implied < loginBest {
+					loginBest = g.Implied
+				}
 			}
 			continue
 		}
 		capGated = true
+		if g.Kind != GuardFunction {
+			// Gated, but the same condition names another way past that we
+			// cannot resolve, so the capability is not what entry costs.
+			continue
+		}
 		if lvl, ok := capabilityGuardLevel(g, code, fileContent); ok {
 			if capBest < 0 || lvl < capBest {
 				capBest = lvl
