@@ -964,9 +964,14 @@ func safeExtract(content string, match []int, index int) string {
 // determineAuthLevelFromCapability maps the capability declared on an admin page
 // onto the ladder.
 //
-// The exact table answers every capability WordPress core defines. Past that, the
-// pattern heuristics recognise the conventional plugin spellings (manage_*,
-// *_users, install_*, and so on) that core itself established.
+// resolveCapabilityLevel answers every capability WordPress core defines, plus
+// whatever the operator configured and whatever map_meta_cap turns a meta
+// capability into. There is no longer a fallback that reads the SHAPE of an
+// unrecognised name: manage_* and *_users used to become Admin, *_others_* and
+// *_private_* Editor. Core assigns no meaning to a capability's spelling and
+// contradicts those shapes directly -- manage_categories and manage_links belong
+// to the editor role -- so the guess raised the privilege of plugin-defined
+// capabilities in 44 of the 143 corpus trees on no evidence at all.
 //
 // What is left is a capability nobody can name: a string the tables do not know,
 // or the "{...}" placeholder resolveAdminArg emits when the argument is a
@@ -979,11 +984,7 @@ func safeExtract(content string, match []int, index int) string {
 // any screen renders, so every admin page needs a logged-in user. Subscriber is
 // that floor and it is the whole of what is known.
 func determineAuthLevelFromCapability(capability string) models.AuthLevel {
-	initCapabilityLevels()
-	if level, ok := capabilityLevels[capability]; ok {
-		return level
-	}
-	if level := inferCapabilityAuthLevel(capability); level != models.Unauthenticated {
+	if level, ok := resolveCapabilityLevel(capability); ok {
 		return level
 	}
 	return models.Subscriber

@@ -674,9 +674,9 @@ func statementEnd(content string, pos int) int {
 	return -1
 }
 
-func isIdentByte(c byte) bool {
-	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
-}
+// isIdentByte lives in rest.go. Both files grew an identical copy while their
+// subsystems were being fixed in parallel; they are the same predicate over the
+// same alphabet, so one definition serves the package.
 
 // normalizeHookName reduces the first argument of a registration to a comparable
 // hook name, collapsing everything the plugin computes at runtime to "*".
