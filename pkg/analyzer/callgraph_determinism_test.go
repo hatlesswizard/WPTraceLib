@@ -226,7 +226,7 @@ func TestExtractCallsDeterminism(t *testing.T) {
 	var firstResult string
 
 	for i := 0; i < runs; i++ {
-		result := strings.Join(cg.extractCalls(code), ",")
+		result := strings.Join(cg.extractCalls(code, callSite{}), ",")
 		if i == 0 {
 			firstResult = result
 		} else if result != firstResult {
@@ -235,7 +235,7 @@ func TestExtractCallsDeterminism(t *testing.T) {
 	}
 
 	// Verify sorted order
-	calls := cg.extractCalls(code)
+	calls := cg.extractCalls(code, callSite{})
 	for i := 1; i < len(calls); i++ {
 		if calls[i] < calls[i-1] {
 			t.Fatalf("extractCalls not sorted: %v", calls)

@@ -266,7 +266,7 @@ func (cg *PluginCallGraph) registrationClosureCalls(content string) []string {
 		if !c.Registration {
 			continue
 		}
-		for _, call := range cg.extractCalls(c.Body) {
+		for _, call := range cg.extractCalls(c.Body, callSite{}) {
 			if !seen[call] {
 				seen[call] = true
 				out = append(out, call)
