@@ -170,12 +170,29 @@ class P {
 			models.Subscriber,
 		},
 		{
-			// The manage_ prefix is a core convention, so the heuristic that
-			// reads it still answers Admin. This is the bound on the change: it
-			// lowers the answer only where nothing at all is known.
-			"unrecognised capability that still follows a core naming convention",
+			// This case expected Admin when it was written, because a heuristic
+			// then read the manage_ prefix as a core convention. That heuristic
+			// is gone, and the expectation changed with it rather than the
+			// behaviour being reinstated to satisfy the test.
+			//
+			// WordPress assigns no meaning to the shape of a capability name.
+			// WP_User::get_role_caps() merges whatever arrays the site's roles
+			// hold, and map_meta_cap's default branch is `$caps[] = $cap` with
+			// no parsing at all. Core contradicts this particular convention
+			// outright: manage_categories and manage_links are granted to the
+			// EDITOR role, not to administrator. And manage_lane_widgets is a
+			// plugin-defined capability, which core grants to nobody until the
+			// plugin grants it -- frequently below Admin.
+			//
+			// Reading it as Admin was measured raising the privilege of
+			// plugin-defined capabilities in 44 of 143 corpus trees on no
+			// evidence, which is the direction that makes a reachable
+			// vulnerability look gated. What the evidence does support is that
+			// this is a wp-admin screen, and wp-admin/admin.php calls
+			// auth_redirect() before any screen renders.
+			"unrecognised capability whose name merely resembles a core convention",
 			`<?php add_menu_page( 'T', 'T', 'manage_lane_widgets', 'lane_slug', 'lane_render' ); function lane_render() { echo 'hi'; }`,
-			models.Admin,
+			models.Subscriber,
 		},
 	}
 	for _, c := range cases {

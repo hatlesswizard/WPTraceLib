@@ -393,7 +393,7 @@ class Lane {
 }
 
 // TestHookRouteIsFileQualified stops the widening from ending in a discovery
-// loss. deduplicateEndpoints keys on (route, method, type) across the whole
+// loss. mergeEndpoints keys on (route, method, type) across the whole
 // plugin and keeps the higher auth level, so an unqualified "init:init" route --
 // which 166 (hook, method) pairs in 75 of the 143 corpus plugins produce from more
 // than one file -- would collapse several distinct callbacks onto one endpoint and
@@ -412,8 +412,8 @@ class Lane {
 	if a[0].Route == b[0].Route {
 		t.Errorf("routes from different files collide: %q", a[0].Route)
 	}
-	if got := deduplicateEndpoints(append(a, b...)); len(got) != 2 {
-		t.Errorf("deduplicateEndpoints collapsed %v to %d endpoints, want 2", hookRoutes(append(a, b...)), len(got))
+	if got := mergeEndpoints(append(a, b...)); len(got) != 2 {
+		t.Errorf("mergeEndpoints collapsed %v to %d endpoints, want 2", hookRoutes(append(a, b...)), len(got))
 	}
 }
 

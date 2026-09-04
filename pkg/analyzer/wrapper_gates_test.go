@@ -7,8 +7,10 @@ import (
 	"github.com/hatlesswizard/wptracelib/pkg/models"
 )
 
-// findEndpoint returns the first endpoint whose route ends with suffix.
-func findEndpoint(eps []models.Endpoint, routeSuffix string) (models.Endpoint, bool) {
+// findEndpointByRoute returns the first endpoint whose route ends with suffix.
+// rest_lane_test.go has a findEndpoint that matches on CALLBACK and returns a
+// pointer; the two grew in parallel worktrees and are different predicates.
+func findEndpointByRoute(eps []models.Endpoint, routeSuffix string) (models.Endpoint, bool) {
 	for _, ep := range eps {
 		if strings.HasSuffix(ep.Route, routeSuffix) {
 			return ep, true
@@ -85,7 +87,7 @@ class Form_Handler extends WP_REST_Controller {
 
 	registry := &WrapperRegistry{RESTWrappers: wrappers}
 	eps := DetectRESTWrapperCalls(src, "handler.php", "acme", registry)
-	ep, ok := findEndpoint(eps, "/forgot-password")
+	ep, ok := findEndpointByRoute(eps, "/forgot-password")
 	if !ok {
 		t.Fatalf("no endpoint for the wrapper call site; got %+v", eps)
 	}
@@ -307,7 +309,7 @@ class Api {
 	}
 
 	eps := DetectRESTWrapperCalls(src, "api.php", "myplug", &WrapperRegistry{RESTWrappers: wrappers})
-	ep, ok := findEndpoint(eps, "/settings")
+	ep, ok := findEndpointByRoute(eps, "/settings")
 	if !ok {
 		t.Fatalf("no endpoint for the wrapper call site; got %+v", eps)
 	}
@@ -347,7 +349,7 @@ function acme_boot( $endpoint ) {
 		t.Fatalf("expected 1 REST wrapper, got %d: %+v", len(wrappers), wrappers)
 	}
 	eps := DetectRESTWrapperCalls(src, "routes.php", "acme", &WrapperRegistry{RESTWrappers: wrappers})
-	ep, ok := findEndpoint(eps, "/events")
+	ep, ok := findEndpointByRoute(eps, "/events")
 	if !ok {
 		t.Fatalf("no endpoint for the wrapper call site; got %+v", eps)
 	}
@@ -417,7 +419,7 @@ class Api {
 		t.Fatalf("expected 1 REST wrapper, got %d: %+v", len(wrappers), wrappers)
 	}
 	eps := DetectRESTWrapperCalls(src, "api.php", "myplug", &WrapperRegistry{RESTWrappers: wrappers})
-	ep, ok := findEndpoint(eps, "/thing")
+	ep, ok := findEndpointByRoute(eps, "/thing")
 	if !ok {
 		t.Fatalf("no endpoint; got %+v", eps)
 	}
@@ -466,7 +468,7 @@ class Api {
 `
 	wrappers := DiscoverRESTWrappers(src, "api.php")
 	eps := DetectRESTWrapperCalls(src, "api.php", "myplug", &WrapperRegistry{RESTWrappers: wrappers})
-	ep, ok := findEndpoint(eps, "/thing")
+	ep, ok := findEndpointByRoute(eps, "/thing")
 	if !ok {
 		t.Fatalf("no endpoint; got %+v", eps)
 	}
