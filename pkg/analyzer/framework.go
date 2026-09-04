@@ -1295,12 +1295,16 @@ func DetectFrameworkEntryPoints(files map[string]string, pluginSlug string) []mo
 				// reported surface without widening what is examined.
 				continue
 			}
+			// The request that drives an external framework is not a method
+			// this pass can know: a widget renders on a page view and again on
+			// an editor preview POST. Direct file endpoints spell it the same
+			// way for the same reason.
 			qualified := c.name + "::" + m.name
 			out = append(out, models.Endpoint{
 				PluginSlug: pluginSlug,
 				Type:       endpointTypeFramework,
 				Route:      "framework:" + qualified,
-				Method:     "GET",
+				Method:     "GET/POST",
 				AuthLevel:  models.Unauthenticated,
 				Callback:   qualified,
 				File:       c.file,
@@ -1326,7 +1330,10 @@ func frameworkScan(files map[string]string) ([]*frameworkClass, map[string]bool)
 
 	for _, path := range paths {
 		content := files[path]
-		if !strings.Contains(content, "class ") {
+		// Files with no class at all still contribute their function names to
+		// the declared-name set, but skip the extent scan. The probe is the
+		// bare keyword, because any whitespace may follow it.
+		if !strings.Contains(content, "class") {
 			for _, d := range frameworkDeclPattern.FindAllStringSubmatch(content, -1) {
 				declaredNames[strings.ToLower(d[2])] = true
 			}
