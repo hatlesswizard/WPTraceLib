@@ -397,7 +397,7 @@ func DetectHookInputEndpoints(content, filepath, pluginSlug string) []models.End
 			Type:       models.EndpointTypeHookInput,
 			Route:      route,
 			Method:     "POST/GET",
-			AuthLevel:  hookEndpointLevel(hookName, spec, cb, body, handlesInput),
+			AuthLevel:  hookEndpointLevel(hookName, spec, cb, body, handlesInput, strings.HasPrefix(content[loc[0]:], "add_action")),
 			Callback:   callback,
 			File:       filepath,
 			Line:       lineNum,
@@ -439,24 +439,24 @@ func DetectHookInputEndpoints(content, filepath, pluginSlug string) []models.End
 // lifecycle-hook callback carrying a current_user_can() came to be the sole
 // evidence for a vulnerability whose truth is unauthenticated.
 //
-// The single exception preserves the answers this detector already gave: a
-// registration that the old five patterns matched, on one of the ten hooks the old
-// list contained, spelled with add_action, whose body does read request input,
-// keeps its inferred level. That is the whole of the endpoint set that existed
-// before this file was widened, so no hook_input answer already in the benchmark
-// moves, and every endpoint the widening adds is a seed at Unauthenticated that
-// cannot manufacture an over-restriction.
-func hookEndpointLevel(hookName string, spec hookSpec, cb hookCallback, body string, handlesInput bool) models.AuthLevel {
-	if handlesInput && body != "" && legacyLifecycleHooks[hookName] && isLegacyCallbackShape(cb) {
+// The single exception preserves the answers this detector already gave, and the
+// conjunction below is exactly the set of registrations it used to see: one of the
+// ten hooks the old list contained, written with add_action rather than add_filter,
+// in one of the old callback spellings, with a body in this file that reads request
+// input. Anything outside that conjunction is an endpoint the widening created, and
+// those are seeds: emitted at the hook's own level, so the widening cannot
+// manufacture an over-restriction anywhere.
+func hookEndpointLevel(hookName string, spec hookSpec, cb hookCallback, body string, handlesInput, viaAddAction bool) models.AuthLevel {
+	if handlesInput && body != "" && viaAddAction && legacyLifecycleHooks[hookName] && isLegacyCallbackShape(cb) {
 		return InferAuthLevel(body)
 	}
 	return spec.Level
 }
 
-// isLegacyCallbackShape reports whether this spelling is one of the five the
+// isLegacyCallbackShape reports whether this spelling is one of the ones the
 // detector matched before the widening: a quoted function name, a quoted
-// Class::method, [ $this, 'm' ] without a reference sigil, [ __CLASS__, 'm' ],
-// or an inline closure.
+// Class::method, [ $this, 'm' ] without a reference sigil, or [ __CLASS__, 'm' ].
+//
 // A closure is deliberately NOT legacy, even though the old closure pattern
 // matched one. That pattern reported at most one endpoint per (hook, file) and
 // then extracted the FIRST closure in the file, so the body it inferred a level

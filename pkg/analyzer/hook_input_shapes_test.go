@@ -599,3 +599,25 @@ func TestNamespacedFunctionCallback(t *testing.T) {
 		t.Fatalf("static string callback -> %v (cb %q)", hookRoutes(eps), eps[0].Callback)
 	}
 }
+
+// TestAddFilterOnALegacyHookIsASeed pins the last edge of the legacy-preservation
+// rule. add_filter registrations on the original ten hooks -- 21 of them in 17
+// corpus plugins -- produced no endpoint before, so one produced now is a new
+// endpoint and must be a seed, not an inferred level, however its body reads.
+func TestAddFilterOnALegacyHookIsASeed(t *testing.T) {
+	body := `function lane_h() {
+	if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'no' ); }
+	update_option( 'lane', $_POST['v'] );
+}`
+	viaAction := DetectHookInputEndpoints("<?php\nadd_action( 'init', 'lane_h' );\n"+body, "a.php", "p")
+	viaFilter := DetectHookInputEndpoints("<?php\nadd_filter( 'init', 'lane_h' );\n"+body, "a.php", "p")
+	if len(viaAction) != 1 || len(viaFilter) != 1 {
+		t.Fatalf("want one endpoint each, got %v and %v", hookRoutes(viaAction), hookRoutes(viaFilter))
+	}
+	if viaAction[0].AuthLevel != models.Admin {
+		t.Errorf("add_action on a legacy hook = %s, want the level it always reported (admin)", viaAction[0].AuthLevel)
+	}
+	if viaFilter[0].AuthLevel != models.Unauthenticated {
+		t.Errorf("add_filter on a legacy hook = %s, want unauthenticated", viaFilter[0].AuthLevel)
+	}
+}
