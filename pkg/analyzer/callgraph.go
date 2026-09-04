@@ -156,6 +156,29 @@ var (
 		`(?:do_action|apply_filters)\s*\(\s*['"]([^'"]+)['"]`,
 	)
 
+	// Hook names composed at the call site. WordPress plugins routinely write
+	//     apply_filters( 'form_wrap_process_' . $formType, ... )
+	//     do_action( "save_post_{$post->post_type}", ... )
+	// while the handlers register under the composed literal name. Without
+	// these the call site resolves to nothing and the graph is severed at the
+	// hook, which is where a great deal of WordPress control flow lives.
+	//
+	// Only the literal fragment is captured. A name with no literal part at all
+	// is not matched: it identifies nothing, and joining it to every
+	// registration would replace analysis with an edge explosion.
+	wpHookCallConcatPrefixPattern = regexp.MustCompile(
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*['"]([A-Za-z0-9_/-]{4,})['"]\s*\.`,
+	)
+	wpHookCallConcatSuffixPattern = regexp.MustCompile(
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*[^,'"()]+\.\s*['"]([A-Za-z0-9_/-]{4,})['"]\s*[,)]`,
+	)
+	wpHookCallInterpPrefixPattern = regexp.MustCompile(
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*"([A-Za-z0-9_/-]{4,})\{?\$`,
+	)
+	wpHookCallInterpSuffixPattern = regexp.MustCompile(
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*"\{?\$[^"]*\}?([A-Za-z0-9_/-]{4,})"`,
+	)
+
 	// Pre-compiled patterns for ResolveCallback (memory optimization)
 	cleanFunctionNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 	arrayMethodNamePattern   = regexp.MustCompile(`['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]`)
@@ -650,6 +673,23 @@ func (cg *PluginCallGraph) extractCalls(code string) []string {
 				cg.HookRegistry.mu.RUnlock()
 			}
 		}
+
+		// A hook name composed at the call site names a family of hooks rather
+		// than one. Link it to every registration in that family.
+		for _, pat := range [2]*regexp.Regexp{wpHookCallConcatPrefixPattern, wpHookCallInterpPrefixPattern} {
+			for _, match := range pat.FindAllStringSubmatch(code, -1) {
+				if len(match) > 1 {
+					cg.addHookFamilyCalls(match[1], true, calls)
+				}
+			}
+		}
+		for _, pat := range [2]*regexp.Regexp{wpHookCallConcatSuffixPattern, wpHookCallInterpSuffixPattern} {
+			for _, match := range pat.FindAllStringSubmatch(code, -1) {
+				if len(match) > 1 {
+					cg.addHookFamilyCalls(match[1], false, calls)
+				}
+			}
+		}
 	}
 
 	// Convert to sorted slice for deterministic order
@@ -660,6 +700,71 @@ func (cg *PluginCallGraph) extractCalls(code string) []string {
 	sort.Strings(result)
 
 	return result
+}
+
+// usableHookFragment decides whether a literal fragment of a composed hook name
+// is specific enough to match on.
+//
+// WordPress composes dynamic hook names as a subsystem name plus a selector:
+// "save_post_{$post_type}", "form_wrap_process_" . $formType,
+// "{$adapter}_response". The literal half is what identifies the family. A
+// fragment of one or two characters identifies nothing and would join a call
+// site to most of the registry, so the fragment must be at least four
+// characters and must either stop on a word boundary -- which is where a
+// composed name joins -- or be long enough that a coincidental match is
+// unlikely on its own.
+func usableHookFragment(frag string) bool {
+	if len(frag) < 4 {
+		return false
+	}
+	switch frag[len(frag)-1] {
+	case '_', '-', '/':
+		return true
+	}
+	switch frag[0] {
+	case '_', '-', '/':
+		return true
+	}
+	return len(frag) >= 8
+}
+
+// addHookFamilyCalls links a composed hook name to every callback registered
+// under a name in the same family. atStart selects prefix composition
+// ("family_" . $x) from suffix composition ($x . "_family").
+func (cg *PluginCallGraph) addHookFamilyCalls(frag string, atStart bool, calls map[string]bool) {
+	if !usableHookFragment(frag) {
+		return
+	}
+	match := func(hook string) bool {
+		if atStart {
+			return len(hook) > len(frag) && strings.HasPrefix(hook, frag)
+		}
+		return len(hook) > len(frag) && strings.HasSuffix(hook, frag)
+	}
+
+	cg.HookRegistry.mu.RLock()
+	defer cg.HookRegistry.mu.RUnlock()
+
+	for hook, regs := range cg.HookRegistry.Hooks {
+		if match(hook) {
+			for _, reg := range regs {
+				calls[reg.Callback] = true
+			}
+		}
+	}
+	// A registration whose own name was composed is stored by its literal
+	// prefix. Two composed names belong to the same family when either literal
+	// extends the other: "wpforms_process_" . $x registers under the prefix
+	// "wpforms_process_", and a call site saying "wpforms_" . $y reaches it.
+	if atStart {
+		for prefix, regs := range cg.HookRegistry.PrefixHooks {
+			if strings.HasPrefix(prefix, frag) || strings.HasPrefix(frag, prefix) {
+				for _, reg := range regs {
+					calls[reg.Callback] = true
+				}
+			}
+		}
+	}
 }
 
 // GetCallees returns all functions called by the given callback, recursively
@@ -691,6 +796,71 @@ func (cg *PluginCallGraph) getCalleesRecursive(funcName string, visited map[stri
 		*result = append(*result, callee)
 		cg.getCalleesRecursive(callee, visited, result)
 	}
+}
+
+// outgoingCalls resolves one call-graph name to the edges leaving it.
+//
+// A call site and a declaration rarely agree on spelling. extractCalls strips
+// the class prefix from most call sites, so a call to $this->save() is recorded
+// as "save" while the declaration is keyed "Customer::save"; namespaced code
+// adds a third spelling. Looking up only the name as written finds nothing and
+// ends the walk.
+//
+// This is the same resolution collectReachableFiles has always performed for
+// the FILE walk (see the AmbiguousFuncs handling there). Having it in one place
+// keeps the two walks from disagreeing about what is reachable, which they did:
+// entries existed where forty-five endpoints reached a file and none reached
+// any function in it.
+//
+// aliases are the qualified keys a bare name may denote. They are returned
+// separately because they are reachable functions in their own right and belong
+// in the callee set, not merely as a route to further edges.
+func (cg *PluginCallGraph) outgoingCalls(name string) (calls []string, aliases []string) {
+	if name == "" {
+		return nil, nil
+	}
+	bare := name
+	if i := strings.LastIndex(name, "\\"); i >= 0 {
+		bare = name[i+1:]
+	}
+	method := bare
+	if i := strings.LastIndex(bare, "::"); i >= 0 {
+		method = bare[i+2:]
+	}
+
+	cg.mu.RLock()
+	defer cg.mu.RUnlock()
+
+	seenCall := make(map[string]bool)
+	addCalls := func(cs []string) {
+		for _, c := range cs {
+			if !seenCall[c] {
+				seenCall[c] = true
+				calls = append(calls, c)
+			}
+		}
+	}
+	seenAlias := make(map[string]bool)
+
+	for _, key := range [3]string{name, bare, method} {
+		if key == "" {
+			continue
+		}
+		if cs, ok := cg.CallsFrom[key]; ok {
+			addCalls(cs)
+		}
+		for _, qual := range cg.AmbiguousFuncs[key] {
+			if seenAlias[qual] {
+				continue
+			}
+			seenAlias[qual] = true
+			aliases = append(aliases, qual)
+			if cs, ok := cg.CallsFrom[qual]; ok {
+				addCalls(cs)
+			}
+		}
+	}
+	return calls, aliases
 }
 
 // GetCallers returns all functions that call the given callback
@@ -951,9 +1121,25 @@ func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent str
 	// First, try to find the callback body in the current file (for local methods like $this->method)
 	body := lookupFunctionBody(fileContent, callback)
 
-	// If we found the body in the current file, extract its immediate calls
+	// If we found the body in the current file, extract its immediate calls.
+	//
+	// The body alone is not enough. ExtractFunctionCalls is a package-level
+	// function with no call graph, so it cannot resolve do_action('x') to the
+	// callbacks registered for x -- cg.extractCalls does that, and its result
+	// lives in CallsFrom. Taking only the body meant that for every endpoint
+	// whose callback is declared in the file that registered it, which is the
+	// ordinary case, every hook edge was discarded. WordPress control flow runs
+	// through hooks, so that disconnected a large part of each plugin from its
+	// own entry points.
+	//
+	// The two sources are complementary rather than alternative, so both are
+	// used: the body is precise about this declaration, and the graph knows
+	// about hooks and about names spelled differently at the call site.
 	if body != "" {
 		immediateCalls := ExtractFunctionCalls(body)
+		graphCalls, graphAliases := cg.outgoingCalls(callback)
+		immediateCalls = append(immediateCalls, graphAliases...)
+		immediateCalls = append(immediateCalls, graphCalls...)
 		for _, call := range immediateCalls {
 			if !visited[call] {
 				visited[call] = true
@@ -963,28 +1149,20 @@ func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent str
 			}
 		}
 	} else {
-		// Try to find in the plugin-wide index using pre-computed calls
-		cg.mu.RLock()
-		key := callback
-		calls, found := cg.CallsFrom[key]
-		if !found {
-			// Try without class prefix
-			methodOnly := callback
-			if idx := strings.LastIndex(callback, "::"); idx >= 0 {
-				methodOnly = callback[idx+2:]
+		// Try to find in the plugin-wide index using pre-computed calls.
+		calls, aliases := cg.outgoingCalls(callback)
+		for _, alias := range aliases {
+			if !visited[alias] {
+				visited[alias] = true
+				allCalls = append(allCalls, alias)
 			}
-			calls, found = cg.CallsFrom[methodOnly]
 		}
-		cg.mu.RUnlock()
-
-		if found {
-			for _, call := range calls {
-				if !visited[call] {
-					visited[call] = true
-					allCalls = append(allCalls, call)
-					// Recursively follow this call
-					recurseCalls(cg, call, visited, &allCalls)
-				}
+		for _, call := range calls {
+			if !visited[call] {
+				visited[call] = true
+				allCalls = append(allCalls, call)
+				// Recursively follow this call
+				recurseCalls(cg, call, visited, &allCalls)
 			}
 		}
 	}
@@ -1000,25 +1178,27 @@ func recurseCalls(cg *PluginCallGraph, funcName string, visited map[string]bool,
 		return
 	}
 
-	// Look up the pre-computed calls for this function
-	cg.mu.RLock()
-	calls, found := cg.CallsFrom[funcName]
-	if !found {
-		// Try without class prefix
-		methodOnly := funcName
-		if idx := strings.LastIndex(funcName, "::"); idx >= 0 {
-			methodOnly = funcName[idx+2:]
-		}
-		calls, found = cg.CallsFrom[methodOnly]
-	}
-	cg.mu.RUnlock()
+	// Look up the pre-computed calls for this function. outgoingCalls also
+	// maps a bare call name back to the qualified declarations that hold the
+	// edges, which is what the file walk does and what this walk used to omit.
+	calls, aliases := cg.outgoingCalls(funcName)
 
-	if !found {
+	// An alias is a real function that this name may denote, so it is part of
+	// the callee set and not merely a route to further edges. Recording it is
+	// what lets a caller ask "does this endpoint reach Customer::save" and get
+	// an answer when the call site only ever said "save".
+	for _, alias := range aliases {
+		if !visited[alias] {
+			visited[alias] = true
+			*allCalls = append(*allCalls, alias)
+		}
+	}
+
+	if len(calls) == 0 {
 		// External function (WordPress core, PHP built-in, or not found in plugin)
 		return
 	}
 
-	// Use the pre-computed calls
 	for _, call := range calls {
 		if !visited[call] {
 			visited[call] = true
