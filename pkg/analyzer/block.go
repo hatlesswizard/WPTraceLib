@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/hatlesswizard/wptracelib/pkg/models"
@@ -9,19 +10,23 @@ import (
 
 // Package-level compiled regex patterns for Gutenberg block detection
 var (
-	// Pattern 1: register_block_type('namespace/block', [...])
-	registerBlockStringPattern = regexp.MustCompile(
-		`register_block_type\s*\(\s*['"]([^'"]+)['"]\s*,`,
-	)
-
-	// Pattern 2: register_block_type(__DIR__) - block.json in directory
-	registerBlockDirPattern = regexp.MustCompile(
-		`register_block_type\s*\(\s*__DIR__`,
-	)
-
-	// Pattern 3: register_block_type_from_metadata(...)
-	registerBlockMetadataPattern = regexp.MustCompile(
-		`register_block_type_from_metadata\s*\(`,
+	// The block registration call itself, in either spelling.
+	//
+	// The detector used to key on `register_block_type\s*\(\s*'literal-name'\s*,`
+	// -- a literal first argument -- and since WordPress 5.8 that argument may
+	// equally be a path to a block.json or to the directory holding one, which is
+	// the form the tooling generates. Of the 486 registration sites in the 143
+	// corpus trees only 111 spell the name as a literal, so 375 sites in 36
+	// block-registering plugins produced no endpoint at all. What decides whether
+	// there is an endpoint is the second argument's render_callback, not how the
+	// first argument is spelled, so the call site is matched and its arguments
+	// are then parsed.
+	//
+	// The leading word boundary matters: without it the pattern also fires inside
+	// unregister_block_type(), and a block being REMOVED would be reported as an
+	// endpoint.
+	registerBlockCallPattern = regexp.MustCompile(
+		`\bregister_block_type(?:_from_metadata)?\s*\(`,
 	)
 
 	// render_callback patterns
@@ -30,107 +35,155 @@ var (
 		`['"]render_callback['"]\s*=>\s*['"]([^'"]+)['"]`,
 	)
 
-	// Pattern 2: 'render_callback' => [$this, 'method']
-	renderCallbackThisBracketPattern = regexp.MustCompile(
-		`['"]render_callback['"]\s*=>\s*\[\s*\$this\s*,\s*['"]([^'"]+)['"]`,
-	)
-
-	// Pattern 3: 'render_callback' => array($this, 'method')
+	// Pattern 2: 'render_callback' => [$this, 'method'] / array($this, 'method')
 	renderCallbackThisArrayPattern = regexp.MustCompile(
-		`['"]render_callback['"]\s*=>\s*array\s*\(\s*\$this\s*,\s*['"]([^'"]+)['"]`,
+		`['"]render_callback['"]\s*=>\s*(?:\[|array\s*\()\s*&?\s*\$this\s*,\s*['"]([^'"]+)['"]`,
 	)
 
-	// Pattern 4: 'render_callback' => [__CLASS__, 'method']
+	// Pattern 3: 'render_callback' => [__CLASS__, 'method'] / array(__CLASS__, ...)
 	renderCallbackClassConstPattern = regexp.MustCompile(
 		`['"]render_callback['"]\s*=>\s*(?:\[|array\s*\()\s*__CLASS__\s*,\s*['"]([^'"]+)['"]`,
 	)
 
-	// Pattern 5: 'render_callback' => function($attributes, $content) { ... }
-	renderCallbackAnonPattern = regexp.MustCompile(
-		`['"]render_callback['"]\s*=>\s*function\s*\(`,
-	)
-
-	// Pattern 6: 'render_callback' => [ClassName::class, 'method']
+	// Pattern 4: 'render_callback' => [ClassName::class, 'method'], which also
+	// covers [self::class, ...] and [static::class, ...].
 	renderCallbackClassMethodPattern = regexp.MustCompile(
-		`['"]render_callback['"]\s*=>\s*\[\s*([A-Za-z_][A-Za-z0-9_\\]*)::class\s*,\s*['"]([^'"]+)['"]`,
+		`['"]render_callback['"]\s*=>\s*(?:\[|array\s*\()\s*([A-Za-z_][A-Za-z0-9_\\]*)::class\s*,\s*['"]([^'"]+)['"]`,
 	)
 
-	// Pattern to extract block name from block.json style registration
-	// Looks for 'name' => 'namespace/block-name' in the args
-	blockNamePattern = regexp.MustCompile(
-		`['"]name['"]\s*=>\s*['"]([^'"]+)['"]`,
+	// Pattern 5: 'render_callback' => [$obj, 'method'] for any object variable.
+	// The method name alone is what the call graph resolves, exactly as
+	// NormalizeCallback reduces an array callback elsewhere in the analyzer.
+	renderCallbackVarArrayPattern = regexp.MustCompile(
+		`['"]render_callback['"]\s*=>\s*(?:\[|array\s*\()\s*&?\s*\$[A-Za-z_][A-Za-z0-9_]*\s*(?:->[A-Za-z_][A-Za-z0-9_]*)*\s*,\s*['"]([^'"]+)['"]`,
+	)
+
+	// Pattern 6: 'render_callback' => function(...) or fn(...)
+	renderCallbackAnonPattern = regexp.MustCompile(
+		`['"]render_callback['"]\s*=>\s*(?:static\s+)?(?:function|fn)\s*\(`,
 	)
 )
 
-// DetectBlocks finds all Gutenberg block registrations and returns them as endpoints.
-// Creates up to two endpoints per block:
-// 1. block:{name}:render - Frontend render callback (auth from callback analysis)
-// 2. block:{name}:editor - Block editor context (Contributor level - requires edit_posts)
+// DetectBlocks finds Gutenberg block registrations and returns them as
+// endpoints.
+//
+// A block with a render_callback is a dynamic block, and WordPress gives it two
+// distinct request paths:
+//
+//   - do_blocks() runs the callback from the_content when a published post
+//     containing the block is rendered, which any visitor can request.
+//   - GET /wp-json/wp/v2/block-renderer/<name> runs the same callback with
+//     attributes taken straight from the request.
+//     WP_REST_Block_Renderer_Controller::get_item_permissions_check() requires
+//     current_user_can('edit_post', $post_id) or current_user_can('edit_posts'),
+//     which is Contributor, and get_item() refuses any block whose type is not
+//     dynamic.
+//
+// Both endpoints therefore name the same callback. Because the reported level of
+// a function is the minimum over the endpoints that reach it, the Contributor
+// endpoint can never raise an answer above the Unauthenticated render endpoint
+// beside it; what it does is bound the render endpoint from above when
+// InferAuthLevel raises that one out of Unauthenticated.
+//
+// A block with no render_callback has no server-side PHP for the block-renderer
+// route to run, so no endpoint is pointed at that route for it. It still gets
+// the editor endpoint it has always had -- loading the block editor does load the
+// plugin's registration file -- carrying the same Contributor level and the same
+// unresolvable callback as before. That endpoint is honest file-level evidence
+// and deleting it would be the one move here that can raise a reported
+// privilege, so it stays exactly as it was.
+//
+// One shape this pass cannot decide: since WordPress 6.1 a block.json may carry
+// `"render": "file:./render.php"`, and core then synthesises a render callback
+// that includes that PHP file on every front-end render -- an Unauthenticated
+// path. 108 of the corpus's 851 block.json files, in 7 of 143 trees, declare
+// one. A registration that points at such a directory looks static here, and is
+// reported only through its Contributor editor endpoint. The consequence is
+// bounded rather than absent: that endpoint's reach is the REGISTRATION file and
+// its include closure, and the render PHP file is included by core rather than
+// by the plugin, so it is not in that closure and does not inherit the
+// Contributor level. Closing the gap properly means reading block.json, which
+// needs a plugin-root-aware entry point this per-file detector does not have.
 func DetectBlocks(content, filepath, pluginSlug string) []models.Endpoint {
 	var endpoints []models.Endpoint
 
-	// Track unique blocks
 	type blockInfo struct {
-		name           string
-		callback       string
-		callbackBody   string
-		hasRenderCB    bool
-		registrationPos int
+		name         string
+		callback     string
+		callbackBody string
+		hasRenderCB  bool
+		line         int
 	}
 
 	var blocks []blockInfo
 
-	// Find register_block_type calls with string name
-	for _, m := range registerBlockStringPattern.FindAllStringSubmatchIndex(content, -1) {
-		if len(m) >= 4 {
-			blockName := content[m[2]:m[3]]
-			startPos := m[0]
-
-			// Extract the registration args
-			argsStart := strings.Index(content[startPos:], ",")
-			if argsStart == -1 {
-				continue
-			}
-			argsStart += startPos + 1
-
-			// Find the array/bracket that starts the args
-			argsBraceStart := -1
-			for i := argsStart; i < len(content) && i < startPos+500; i++ {
-				if content[i] == '[' || (i+4 < len(content) && content[i:i+5] == "array") {
-					argsBraceStart = i
-					break
-				}
-			}
-
-			if argsBraceStart == -1 {
-				continue
-			}
-
-			// Extract args content
-			argsContent := extractBlockArgs(content, argsBraceStart)
-
-			// Look for render_callback
-			callback, callbackBody := extractRenderCallback(argsContent, content)
-
-			blocks = append(blocks, blockInfo{
-				name:            blockName,
-				callback:        callback,
-				callbackBody:    callbackBody,
-				hasRenderCB:     callback != "",
-				registrationPos: startPos,
-			})
-		}
-	}
-
-	// Create endpoints for each unique block
-	seen := make(map[string]bool)
-	for _, block := range blocks {
-		if seen[block.name] {
+	for _, m := range registerBlockCallPattern.FindAllStringIndex(content, -1) {
+		callStart, parenPos := m[0], m[1]-1
+		args := splitBlockCallArgs(content, parenPos)
+		if len(args) == 0 {
 			continue
 		}
-		seen[block.name] = true
+		line := countLines(content[:callStart]) + 1
 
-		// Create render endpoint if there's a render callback
+		callback, callbackBody := "", ""
+		if len(args) >= 2 {
+			callback, callbackBody = extractRenderCallback(args[1], content)
+		}
+
+		name := blockNameFromArg(args[0])
+		if name == "" {
+			// The first argument is a path, a variable or a concatenation, so
+			// the block's name lives in a block.json this pass cannot read. The
+			// endpoint is still worth having -- the name is a label and the
+			// callback is what carries reach -- but then the route has to stay
+			// unique per registration site. A shared "{dynamic}" route would
+			// collide in deduplicateEndpoints, which keys on Route|Method|Type
+			// across the whole plugin, and a loop registering three blocks from
+			// one call site would have two of its three render callbacks
+			// discovered and then thrown away. 14 dynamic first-argument
+			// expressions repeat within a single plugin, across 11 of the 143
+			// corpus trees.
+			//
+			// When there is no callback to lose there is nothing to keep apart:
+			// every such site in one file yields the identical fact, that this
+			// file registers a block the editor screen loads, so they collapse
+			// to one endpoint per file rather than one per line. A plugin that
+			// registers its blocks in a loop over a directory listing otherwise
+			// produces dozens of identical rows.
+			name = "{dynamic}@" + strings.ReplaceAll(filepath, `\`, "/")
+			if callback != "" {
+				name += ":" + strconv.Itoa(line)
+			}
+		}
+
+		blocks = append(blocks, blockInfo{
+			name:         name,
+			callback:     callback,
+			callbackBody: callbackBody,
+			hasRenderCB:  callback != "",
+			line:         line,
+		})
+	}
+
+	// One endpoint set per block name. When the same name is registered more
+	// than once in a file, the registration that names a render callback is the
+	// informative one.
+	byName := map[string]int{}
+	var order []string
+	for i, b := range blocks {
+		if idx, ok := byName[b.name]; ok {
+			if b.hasRenderCB && !blocks[idx].hasRenderCB {
+				byName[b.name] = i
+			}
+			continue
+		}
+		byName[b.name] = i
+		order = append(order, b.name)
+	}
+
+	for _, name := range order {
+		block := blocks[byName[name]]
+
 		if block.hasRenderCB {
 			authLevel := models.Unauthenticated // Default for frontend blocks
 
@@ -144,86 +197,121 @@ func DetectBlocks(content, filepath, pluginSlug string) []models.Endpoint {
 			endpoints = append(endpoints, models.Endpoint{
 				PluginSlug: pluginSlug,
 				Type:       models.EndpointTypeBlock,
-				Route:      "block:" + block.name + ":render",
+				Route:      "block:" + name + ":render",
 				AuthLevel:  authLevel,
 				Callback:   block.callback,
 				File:       filepath,
+				Line:       block.line,
 			})
+
+			endpoints = append(endpoints, models.Endpoint{
+				PluginSlug: pluginSlug,
+				Type:       models.EndpointTypeBlock,
+				Route:      "block:" + name + ":block-renderer",
+				AuthLevel:  models.Contributor, // edit_posts, per WP_REST_Block_Renderer_Controller
+				Callback:   block.callback,
+				File:       filepath,
+				Line:       block.line,
+			})
+			continue
 		}
 
-		// Create editor endpoint (always Contributor level - requires edit_posts)
 		endpoints = append(endpoints, models.Endpoint{
 			PluginSlug: pluginSlug,
 			Type:       models.EndpointTypeBlock,
-			Route:      "block:" + block.name + ":editor",
-			AuthLevel:  models.Contributor, // edit_posts required for block editor
+			Route:      "block:" + name + ":editor",
+			AuthLevel:  models.Contributor, // edit_posts required for the block editor
 			Callback:   "(Gutenberg editor)",
 			File:       filepath,
+			Line:       block.line,
 		})
 	}
 
 	return endpoints
 }
 
-// extractBlockArgs extracts the block registration arguments
-func extractBlockArgs(content string, startPos int) string {
-	// Handle both array() and [] notation
-	if startPos >= len(content) {
+// blockNameFromArg returns the block name when the first argument to
+// register_block_type is a single quoted literal, and "" otherwise. A path, a
+// constant, a variable or a concatenation all yield "".
+func blockNameFromArg(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if len(arg) < 2 {
 		return ""
 	}
-
-	if content[startPos] == '[' {
-		return extractBracedContentCustom(content, startPos, '[', ']')
-	}
-
-	// array() notation
-	parenStart := strings.Index(content[startPos:], "(")
-	if parenStart == -1 {
+	q := arg[0]
+	if q != '\'' && q != '"' {
 		return ""
 	}
-	return extractBracedContentCustom(content, startPos+parenStart, '(', ')')
+	if arg[len(arg)-1] != q {
+		return ""
+	}
+	inner := arg[1 : len(arg)-1]
+	// A quote inside means the literal ended early and something was
+	// concatenated onto it.
+	if strings.IndexByte(inner, q) >= 0 {
+		return ""
+	}
+	return inner
 }
 
-// extractBracedContentCustom extracts content between matching braces
-func extractBracedContentCustom(content string, startPos int, openBrace, closeBrace byte) string {
-	if startPos >= len(content) || content[startPos] != openBrace {
-		return ""
+// splitBlockCallArgs returns the top-level arguments of the call whose opening
+// parenthesis is at parenPos.
+//
+// A regex cannot do this: the second argument is an arbitrarily nested array
+// whose own commas, brackets and quoted strings have to be stepped over, and the
+// pattern this detector used instead took the first comma after the block name
+// and then hunted forward for the next `[` or `array` -- which, for a
+// registration with no second argument, found the next unrelated one further
+// down the file.
+//
+// When the call is unbalanced -- which for comment-stripped content means the
+// file is truncated -- the arguments found so far are returned rather than
+// nothing, since a missing endpoint is worse than an approximate one.
+func splitBlockCallArgs(content string, parenPos int) []string {
+	if parenPos >= len(content) || content[parenPos] != '(' {
+		return nil
 	}
 
+	var args []string
 	depth := 0
 	inString := false
-	stringChar := byte(0)
+	var stringChar byte
+	start := parenPos + 1
 
-	for i := startPos; i < len(content); i++ {
+	for i := parenPos; i < len(content); i++ {
 		c := content[i]
 
 		if inString {
-			if c == stringChar && (i == 0 || content[i-1] != '\\') {
+			if c == '\\' {
+				i++
+				continue
+			}
+			if c == stringChar {
 				inString = false
 			}
 			continue
 		}
 
 		switch c {
-		case '"', '\'':
+		case '\'', '"':
 			inString = true
 			stringChar = c
-		case openBrace:
+		case '(', '[', '{':
 			depth++
-		case closeBrace:
+		case ')', ']', '}':
 			depth--
 			if depth == 0 {
-				return content[startPos : i+1]
+				return append(args, content[start:i])
+			}
+		case ',':
+			if depth == 1 {
+				args = append(args, content[start:i])
+				start = i + 1
 			}
 		}
 	}
 
-	// Return up to 2000 chars if no match
-	maxLen := startPos + 2000
-	if maxLen > len(content) {
-		maxLen = len(content)
-	}
-	return content[startPos:maxLen]
+	return append(args, content[start:])
 }
 
 // extractRenderCallback extracts the render callback and its body
@@ -235,14 +323,7 @@ func extractRenderCallback(argsContent, fullContent string) (callback string, bo
 		return
 	}
 
-	// Try $this bracket pattern
-	if m := renderCallbackThisBracketPattern.FindStringSubmatch(argsContent); len(m) >= 2 {
-		callback = m[1]
-		body = findFunctionBody(callback, fullContent)
-		return
-	}
-
-	// Try $this array pattern
+	// Try $this array pattern, in either array syntax
 	if m := renderCallbackThisArrayPattern.FindStringSubmatch(argsContent); len(m) >= 2 {
 		callback = m[1]
 		body = findFunctionBody(callback, fullContent)
@@ -260,6 +341,13 @@ func extractRenderCallback(argsContent, fullContent string) (callback string, bo
 	if m := renderCallbackClassMethodPattern.FindStringSubmatch(argsContent); len(m) >= 3 {
 		callback = m[1] + "::" + m[2]
 		body = findFunctionBody(m[2], fullContent)
+		return
+	}
+
+	// Try an array callback on any other object variable
+	if m := renderCallbackVarArrayPattern.FindStringSubmatch(argsContent); len(m) >= 2 {
+		callback = m[1]
+		body = findFunctionBody(callback, fullContent)
 		return
 	}
 
