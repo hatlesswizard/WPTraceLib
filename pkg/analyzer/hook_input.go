@@ -457,9 +457,16 @@ func hookEndpointLevel(hookName string, spec hookSpec, cb hookCallback, body str
 // detector matched before the widening: a quoted function name, a quoted
 // Class::method, [ $this, 'm' ] without a reference sigil, [ __CLASS__, 'm' ],
 // or an inline closure.
+// A closure is deliberately NOT legacy, even though the old closure pattern
+// matched one. That pattern reported at most one endpoint per (hook, file) and
+// then extracted the FIRST closure in the file, so the body it inferred a level
+// from was frequently not the body of the registration it reported. Inferring a
+// level from a body that may belong to a different callback is the same defect
+// the admin-page detector had to be guarded against, and here it can only lower
+// the answer to drop it -- which is the tolerated direction.
 func isLegacyCallbackShape(cb hookCallback) bool {
 	switch cb.Shape {
-	case shapeFunctionName, shapeStaticString, shapeClosure:
+	case shapeFunctionName, shapeStaticString:
 		return true
 	case shapeThis:
 		return !strings.Contains(cb.Raw, "&")
@@ -778,6 +785,14 @@ func parseHookCallback(raw string) hookCallback {
 		}
 		if hookIdentPattern.MatchString(unquoted) {
 			return hookCallback{Shape: shapeFunctionName, Method: unquoted, Raw: raw}
+		}
+		// A namespace-qualified function name. Every walk downstream keys on the
+		// bare tail, so the qualifier is stripped rather than treated as a class:
+		// '\Lane\boot' is a function called boot, not a method of Lane.
+		if hookClassNamePattern.MatchString(unquoted) {
+			if i := strings.LastIndex(unquoted, "\\"); i >= 0 {
+				return hookCallback{Shape: shapeFunctionName, Method: unquoted[i+1:], Raw: raw}
+			}
 		}
 		return hookCallback{}
 	}

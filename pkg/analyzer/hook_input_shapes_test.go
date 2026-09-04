@@ -561,3 +561,41 @@ func TestHookEndpointLineNumbers(t *testing.T) {
 		}
 	}
 }
+
+// TestClosureEndpointIsAlwaysASeed is the bound on the closure enumeration. The
+// old pattern reported one endpoint per (hook, file) and then read the FIRST
+// closure in the file, so the level it inferred often came from a different
+// closure's body. Enumerating them properly must not turn that into a raise: a
+// closure endpoint is a reachability seed at the hook's own level.
+func TestClosureEndpointIsAlwaysASeed(t *testing.T) {
+	php := `<?php
+add_action( 'admin_init', function () {
+	if ( ! current_user_can( 'manage_options' ) ) { wp_die( 'no' ); }
+	update_option( 'lane', $_POST['v'] );
+} );`
+	eps := DetectHookInputEndpoints(php, "a.php", "p")
+	if len(eps) != 1 {
+		t.Fatalf("want 1 endpoint, got %v", hookRoutes(eps))
+	}
+	if eps[0].AuthLevel != models.Unauthenticated {
+		t.Errorf("closure endpoint = %s, want unauthenticated", eps[0].AuthLevel)
+	}
+}
+
+// TestNamespacedFunctionCallback keeps a qualified function name usable. Every
+// walk downstream keys on the bare tail, so the qualifier is stripped rather than
+// read as a class name: '\Lane\boot' is a function called boot.
+func TestNamespacedFunctionCallback(t *testing.T) {
+	php := `<?php add_action( 'init', '\Lane\Boot\run' ); `
+	eps := DetectHookInputEndpoints(php, "a.php", "p")
+	if len(eps) != 1 || eps[0].Callback != "run" {
+		t.Fatalf("namespaced function callback -> %v", hookRoutes(eps))
+	}
+
+	// The bound: a genuine Class::method string still yields the class.
+	php = `<?php add_action( 'init', 'Lane\Boot::run' ); `
+	eps = DetectHookInputEndpoints(php, "a.php", "p")
+	if len(eps) != 1 || eps[0].Callback != `Lane\Boot::run` {
+		t.Fatalf("static string callback -> %v (cb %q)", hookRoutes(eps), eps[0].Callback)
+	}
+}
