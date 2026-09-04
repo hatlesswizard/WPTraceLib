@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -35,6 +36,17 @@ type FunctionDef struct {
 type HookRegistration struct {
 	Callback string // Resolved callback name
 	File     string // File where add_action/add_filter was called
+	// Hook is the hook name the callback was registered under. For a
+	// registration whose name was composed at the call site this is the literal
+	// prefix, which is what PrefixHooks is keyed by.
+	Hook string
+	// Synthesized marks a registration that was not written literally in the
+	// source. `add_action( 'h_' . $a, array( $this, $m ) )` names a method the
+	// language bounds to the enclosing class but does not spell out, so one
+	// registration is recorded per method of that class. Those are sound as
+	// call-graph edges and must not be mistaken for evidence that a particular
+	// callback was registered.
+	Synthesized bool
 }
 
 // HookRegistry maps hook names to their registered callbacks.
@@ -42,14 +54,26 @@ type HookRegistration struct {
 type HookRegistry struct {
 	Hooks       map[string][]HookRegistration
 	PrefixHooks map[string][]HookRegistration
+	// Fired holds every hook name this tree fires with a string literal.
+	Fired map[string]bool
+	// FiredPrefixes holds the literal head of every firing whose name was
+	// composed at the call site: do_action( 'save_post_' . $type ).
+	FiredPrefixes map[string]bool
+	// FiredOpaque records that the tree fires at least one hook whose name is
+	// a bare variable or a constant, so it cannot be read. A consumer deciding
+	// that a registration is fired only from outside the plugin should know
+	// that some in-tree firings could not be attributed.
+	FiredOpaque bool
 	mu          sync.RWMutex
 }
 
 // NewHookRegistry creates a new empty hook registry
 func NewHookRegistry() *HookRegistry {
 	return &HookRegistry{
-		Hooks:       make(map[string][]HookRegistration),
-		PrefixHooks: make(map[string][]HookRegistration),
+		Hooks:         make(map[string][]HookRegistration),
+		PrefixHooks:   make(map[string][]HookRegistration),
+		Fired:         make(map[string]bool),
+		FiredPrefixes: make(map[string]bool),
 	}
 }
 
@@ -69,8 +93,44 @@ type PluginCallGraph struct {
 	IncludesFrom map[string][]string
 	// ClassToFile maps class name (and FQN with namespace) to file path
 	ClassToFile map[string]string
+	// ClassToFiles maps a type name to EVERY file declaring it.
+	//
+	// ClassToFile is single-valued and last-writer-wins, so recognising more
+	// type declarations would let a newly visible one displace an existing
+	// mapping and REMOVE the file reach it carried -- measured at 163 names in
+	// 36 of 143 corpus trees when the backslash-parent and trait shapes became
+	// visible. Every reachability consumer reads this many-valued map instead,
+	// so widening what the analyzer can see can only add file reach.
+	ClassToFiles map[string][]string
+	// Types records what is known about each declared type: its kind, its
+	// parent, the traits it uses and the methods it declares. PHP resolves a
+	// method against the class, then its traits in declaration order, then its
+	// parent, and that walk needs all four.
+	Types map[string]*TypeDef
+	// typeFold maps a lower-cased type name to its canonical spelling. PHP type
+	// names are case-insensitive while the graph preserves the source's case,
+	// so `extends WPForms_Field` must find a declaration of `WPForms_field`.
+	typeFold map[string]string
 	// FilesByBasename maps file basename to full relative paths for include resolution
 	FilesByBasename map[string][]string
+	// normFiles maps a separator-normalised file path to the key AllFiles
+	// actually holds.
+	//
+	// Callers key the files map by whatever their platform produced:
+	// production passes absolute OS paths, the benchmark passes filepath.Rel
+	// output, and both carry backslashes on Windows. Include paths inside PHP
+	// source are written with forward slashes, so every suffix comparison
+	// against a raw key failed on Windows and include resolution silently
+	// degraded to unique-basename matching. Comparisons are made against this
+	// index and the ORIGINAL key is returned, so no downstream consumer ever
+	// sees a path spelled differently from the one it passed in.
+	normFiles map[string]string
+	// DeclaredNames holds every bare function and method name this tree
+	// declares. extractCalls drops a call whose name is a WordPress core
+	// function, which is wrong when the plugin declares a function of that name
+	// itself -- 730 such declarations across 102 of 143 corpus trees, and 2,943
+	// `$this-><coreName>(` call sites in 74 of them.
+	DeclaredNames map[string]bool
 	// AllFiles tracks every PHP file path passed to BuildCallGraph
 	AllFiles map[string]bool
 	// DynIncluders maps function names that contain variable includes to directory hints
@@ -85,13 +145,18 @@ type PluginCallGraph struct {
 // NewPluginCallGraph creates a new empty call graph
 func NewPluginCallGraph() *PluginCallGraph {
 	return &PluginCallGraph{
-		Functions:       make(map[string]*FunctionDef),
-		CallsFrom:       make(map[string][]string),
-		CallsTo:         make(map[string][]string),
-		AmbiguousFuncs:  make(map[string][]string),
-		IncludesFrom:    make(map[string][]string),
-		ClassToFile:     make(map[string]string),
-		FilesByBasename: make(map[string][]string),
+		Functions:        make(map[string]*FunctionDef),
+		CallsFrom:        make(map[string][]string),
+		CallsTo:          make(map[string][]string),
+		AmbiguousFuncs:   make(map[string][]string),
+		IncludesFrom:     make(map[string][]string),
+		ClassToFile:      make(map[string]string),
+		ClassToFiles:     make(map[string][]string),
+		Types:            make(map[string]*TypeDef),
+		typeFold:         make(map[string]string),
+		FilesByBasename:  make(map[string][]string),
+		normFiles:        make(map[string]string),
+		DeclaredNames:    make(map[string]bool),
 		AllFiles:         make(map[string]bool),
 		DynIncluders:     make(map[string][]string),
 		AutoloadBaseDirs: make([]string, 0),
@@ -101,23 +166,13 @@ func NewPluginCallGraph() *PluginCallGraph {
 
 // Package-level compiled regex patterns for call graph analysis
 var (
-	// Pattern to find function definitions
-	// Matches: function name(...) { or function name(...):type {
-	funcDefPattern = regexp.MustCompile(
-		`(?m)^[\t ]*(?:(?:public|private|protected|static|final|abstract)\s+)*` +
-			`function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)` +
-			`(?:\s*:\s*[?]?[a-zA-Z_][a-zA-Z0-9_|\\]*)?` +
-			`\s*\{`,
-	)
+	// Function declarations are found by FindFunctionDeclarations (funcdecl.go),
+	// which walks the parameter list's delimiters. The regex that preceded it
+	// is deliberately gone rather than left unused: `\([^)]*\)` cannot match a
+	// balanced parameter list, and RE2 offers no way to make it.
 
-	// Pattern to find class definitions
-	// Matches: class ClassName { or class ClassName extends Parent {
-	classDefPattern = regexp.MustCompile(
-		`(?m)^[\t ]*(?:(?:abstract|final)\s+)?class\s+([a-zA-Z_][a-zA-Z0-9_]*)` +
-			`(?:\s+extends\s+[a-zA-Z_][a-zA-Z0-9_\\]*)?` +
-			`(?:\s+implements\s+[a-zA-Z_][a-zA-Z0-9_\\,\s]*)?` +
-			`\s*\{`,
-	)
+	// Class, trait, interface and enum declarations are recognised by
+	// classDeclPattern in classinfo.go, which classDefPattern aliases.
 
 	// Pattern for direct function calls: function_name(...)
 	directCallPattern = regexp.MustCompile(
@@ -152,8 +207,12 @@ var (
 	)
 
 	// Pattern for do_action and apply_filters (WordPress hooks that trigger callbacks)
+	//
+	// do_action_ref_array and apply_filters_ref_array fire a hook exactly as
+	// their plain counterparts do -- the only difference is how arguments are
+	// passed -- so a pattern that omits them severs 268 firings across 49 trees.
 	wpHookCallPattern = regexp.MustCompile(
-		`(?:do_action|apply_filters)\s*\(\s*['"]([^'"]+)['"]`,
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*['"]([^'"]+)['"]`,
 	)
 
 	// Hook names composed at the call site. WordPress plugins routinely write
@@ -177,6 +236,13 @@ var (
 	)
 	wpHookCallInterpSuffixPattern = regexp.MustCompile(
 		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*"\{?\$[^"]*\}?([A-Za-z0-9_/-]{4,})"`,
+	)
+
+	// A firing whose name is a bare variable, a constant or a call: the name
+	// cannot be read, so "this tree never fires that hook" cannot be concluded
+	// from its absence.
+	wpHookCallOpaquePattern = regexp.MustCompile(
+		`(?:do_action|apply_filters)(?:_ref_array)?\s*\(\s*(?:\$|[A-Z][A-Z0-9_]{2,}\s*[,)])`,
 	)
 
 	// Pre-compiled patterns for ResolveCallback (memory optimization)
@@ -225,9 +291,53 @@ var (
 			`(\[[^\]]*\]|array\s*\([^)]*\)|[^,)]+)`,
 	)
 
-	// Pattern for PHP trait usage inside class bodies
-	traitUsePattern = regexp.MustCompile(
-		`(?m)^\s+use\s+([A-Z][a-zA-Z0-9_\\]+(?:\s*,\s*[A-Z][a-zA-Z0-9_\\]+)*)\s*[;{]`,
+	// PHP trait usage inside a type body is matched by traitUsePattern in
+	// classinfo.go.
+
+	// Instantiation. `new` is a PHP keyword, so the class name survives only as
+	// a bare token from directCallPattern -- and then only when the call is
+	// written with parentheses. `new Klass;`, `return new Klass,` and
+	// `new Klass)` are all legal and emit nothing at all today: 2,409 such
+	// sites across 81 of 143 corpus trees, 916 of them naming a class that
+	// declares __construct.
+	//
+	// `new self`, `new static` and `new parent` are matched here too and are
+	// mapped to the enclosing class by the caller. `new class` (an anonymous
+	// class) and `new $var` are excluded: the first names no type, and the
+	// second names one this pattern cannot read.
+	newInstancePattern = regexp.MustCompile(
+		`\bnew\s+\\?([a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff\\]*)`,
+	)
+
+	// A class named by a variable: `new $classname()` and `$classname::method()`.
+	// Framework-shaped plugins route every request through one of these, so the
+	// dispatch layer is a cut edge without them: 1,373 `new $var` sites in 107
+	// of 143 corpus trees and 1,137 `$var::method()` sites in 60.
+	newVarPattern        = regexp.MustCompile(`\bnew\s+\$([a-zA-Z_][a-zA-Z0-9_]*)`)
+	varStaticCallPattern = regexp.MustCompile(
+		`\$([a-zA-Z_][a-zA-Z0-9_]*)\s*::\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+
+	// An assignment whose right-hand side may be a string built from literals.
+	// The value is bounded to a few hundred characters because a class name is
+	// short and the scan is per function body.
+	varAssignPattern = regexp.MustCompile(
+		`\$([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([^;{}]{1,300});`)
+
+	// A method call whose NAME is held in a variable: $this->$m(), $this->{$m}().
+	// The receiver is not unknown -- $this is an instance of the lexically
+	// enclosing class -- so the target is one of that class's methods.
+	thisVarMethodPattern = regexp.MustCompile(
+		`\$this\s*->\s*\{?\s*\$([a-zA-Z_][a-zA-Z0-9_]*)\s*\}?\s*\(`,
+	)
+
+	// call_user_func(array($this, $m)) and its variants, where the method slot
+	// is a variable rather than a literal, optionally with a literal prefix:
+	// array($this, 'action' . $name). PHP string concatenation is
+	// prefix-preserving, so "action" . $x can only ever name a method whose
+	// name starts with "action".
+	callUserFuncThisVarPattern = regexp.MustCompile(
+		`(?:call_user_func(?:_array)?|method_exists|is_callable)\s*\(\s*` +
+			`(?:\[|array\s*\()\s*\$this\s*,\s*(?:['"]([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*\.\s*)?\$`,
 	)
 
 	// Pattern to extract class name from callback expressions like ClassName::class
@@ -325,15 +435,31 @@ var (
 	}
 )
 
+// fileParse is one file's structure, parsed once and shared by every sub-pass.
+//
+// Five sub-passes used to rebuild the class ranges independently, which is five
+// brace-matching scans of every file in the plugin, and two of them parsed the
+// function declarations a second time as well. Under this project's memory
+// ceiling that is worth doing once.
+type fileParse struct {
+	decls   []FuncDecl
+	types   map[string]classInfo
+	aliases map[string]string
+}
+
 // BuildCallGraph builds a call graph for all PHP files in a plugin
 // Memory-optimized: extracts calls inline during discovery, avoiding body storage
 // DETERMINISM: Files are processed in sorted order to ensure consistent results
 //
-// Three sub-passes:
+// Sub-passes:
 //
+//	0: Parse declarations and type bodies once per file; register types,
+//	   declared names and per-type method lists so later passes can resolve a
+//	   call against the whole tree rather than against one file
 //	A: Build hook registry + extract file includes + register class-to-file mappings
 //	B: Discover functions and extract calls (with hook resolution via registry)
-//	C: Resolve trait usage — alias trait methods to using classes
+//	C: Link each file's load-time code to the load-time code of what it includes
+//	D: Resolve trait usage — alias trait methods to using classes
 func BuildCallGraph(files map[string]string) *PluginCallGraph {
 	cg := NewPluginCallGraph()
 
@@ -350,44 +476,140 @@ func BuildCallGraph(files map[string]string) *PluginCallGraph {
 	}
 	cg.buildFileIndex()
 
+	// Sub-pass 0: parse each file once and register what the whole tree
+	// declares. Sub-pass B needs the finished picture -- which names the plugin
+	// declares, which methods each type has -- so it cannot be folded in.
+	parsed := make(map[string]*fileParse, len(files))
+	for _, fp := range sortedPaths {
+		content := files[fp]
+		p := &fileParse{
+			decls:   FindFunctionDeclarations(content),
+			types:   findClassInfos(content),
+			aliases: fileUseAliases(content),
+		}
+		parsed[fp] = p
+		cg.registerTypes(content, fp, p)
+	}
+
 	// Sub-pass A: Build hook registry, extract includes, register classes, detect dynamic includers
 	for _, fp := range sortedPaths {
-		cg.extractHookRegistrations(files[fp], fp)
+		cg.extractHookRegistrations(files[fp], fp, parsed[fp])
 		cg.extractFileIncludes(files[fp], fp)
-		cg.extractClassToFileMap(files[fp], fp)
-		cg.extractDynIncluders(files[fp], fp)
+		cg.extractDynIncluders(files[fp], fp, parsed[fp])
 		cg.extractAutoloadHints(files[fp], fp)
 	}
 
 	// Sub-pass B: Discover functions, extract calls (with hook resolution), resolve dynamic include edges
 	for _, fp := range sortedPaths {
-		cg.discoverFunctionsAndCalls(files[fp], fp)
+		cg.discoverFunctionsAndCalls(files[fp], fp, parsed[fp])
 		cg.extractDynIncludeEdges(files[fp], fp)
 	}
 
-	// Sub-pass C: Resolve trait usage
-	for _, fp := range sortedPaths {
-		classRanges := findClassRanges(files[fp])
-		cg.discoverTraitUsage(files[fp], classRanges)
-	}
+	// Sub-pass C: give the include graph a function-level twin.
+	cg.linkTopLevelIncludes(sortedPaths)
+
+	// Sub-pass D: Resolve trait usage
+	cg.discoverTraitUsage()
 
 	return cg
 }
 
+// registerTypes records every type this file declares, the names it declares,
+// and the methods of each type.
+//
+// ClassToFile keeps its existing single-valued shape and its existing
+// last-writer rule for classes, so no consumer outside this package sees a
+// different answer than before. A trait, interface or enum is written only when
+// the name is free: a trait named like a class must not displace the class,
+// because dozens of call sites may name that class and only the class's file
+// answers them. ClassToFiles records all of them, which is what reachability
+// reads.
+func (cg *PluginCallGraph) registerTypes(content, filePath string, p *fileParse) {
+	namespace := ""
+	if m := namespacePattern.FindStringSubmatch(content); len(m) > 1 {
+		namespace = m[1]
+	}
+
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	for _, d := range p.decls {
+		cg.DeclaredNames[d.Name] = true
+	}
+
+	for name := range p.types {
+		ci := p.types[name]
+
+		if ci.Kind == "class" {
+			cg.ClassToFile[name] = filePath
+		} else if _, taken := cg.ClassToFile[name]; !taken {
+			cg.ClassToFile[name] = filePath
+		}
+		if namespace != "" {
+			fqn := namespace + "\\" + name
+			if ci.Kind == "class" {
+				cg.ClassToFile[fqn] = filePath
+			} else if _, taken := cg.ClassToFile[fqn]; !taken {
+				cg.ClassToFile[fqn] = filePath
+			}
+			cg.addClassFile(fqn, filePath)
+		}
+		cg.addClassFile(name, filePath)
+
+		td := cg.Types[name]
+		if td == nil {
+			td = &TypeDef{Name: name, Kind: ci.Kind, Parent: ci.Parent}
+			cg.Types[name] = td
+			if lower := strings.ToLower(name); cg.typeFold[lower] == "" {
+				cg.typeFold[lower] = name
+			}
+		} else if td.Parent == "" {
+			td.Parent = ci.Parent
+		}
+		for _, t := range ci.Traits {
+			if !containsName(td.Traits, t) {
+				td.Traits = append(td.Traits, t)
+			}
+		}
+		td.Files = append(td.Files, filePath)
+
+		methods := make([]string, 0, 8)
+		for _, d := range p.decls {
+			if d.DeclStart > ci.Open && d.DeclStart < ci.Close {
+				methods = append(methods, d.Name)
+			}
+		}
+		td.addMethods(methods)
+	}
+}
+
+func (cg *PluginCallGraph) addClassFile(name, filePath string) {
+	if !containsName(cg.ClassToFiles[name], filePath) {
+		cg.ClassToFiles[name] = append(cg.ClassToFiles[name], filePath)
+	}
+}
+
+func containsName(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 // discoverFunctionsAndCalls finds all function definitions and extracts their calls in one pass
 // Memory-optimized: extracts calls immediately without storing function bodies
-func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
-	// Find class boundaries first
-	classRanges := findClassRanges(content)
+func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string, p *fileParse) {
+	// FindFunctionDeclarations scans the parameter list with a
+	// balanced-delimiter walk instead of a regex. funcDefPattern's `\([^)]*\)`
+	// stopped at the first ")" inside the parameters, so every declaration with
+	// a default value like array() or a nested call was invisible -- 11,696 of
+	// 329,198 declarations across a 143-plugin corpus, and 26% of the functions
+	// in some plugins.
+	decls := p.decls
 
-	// Find all function definitions.
-	//
-	// FindFunctionDeclarations scans the parameter list with a balanced-delimiter
-	// walk instead of a regex. funcDefPattern's `\([^)]*\)` stopped at the first
-	// ")" inside the parameters, so every declaration with a default value like
-	// array() or a nested call was invisible -- 11,696 of 329,198 declarations
-	// across a 143-plugin corpus, and 26% of the functions in some plugins.
-	for _, decl := range FindFunctionDeclarations(content) {
+	for _, decl := range decls {
 		funcName := decl.Name
 		startPos := decl.DeclStart
 		startLine := countNewlines(content[:startPos])
@@ -399,21 +621,13 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		// Extract function body temporarily for call extraction
 		body := content[bodyStart:endPos]
 
-		// Determine if this is a method (inside a class)
-		// DETERMINISM: Find the innermost containing class (smallest range)
-		// instead of breaking on first map iteration hit
+		// Determine which type declaration lexically encloses this function.
+		encl := enclosingType(startPos, p.types)
 		className := ""
 		isMethod := false
-		smallestRange := int(^uint(0) >> 1) // max int
-		for cn, bounds := range classRanges {
-			if startPos > bounds[0] && startPos < bounds[1] {
-				rangeSize := bounds[1] - bounds[0]
-				if rangeSize < smallestRange {
-					smallestRange = rangeSize
-					className = cn
-					isMethod = true
-				}
-			}
+		if encl != nil {
+			className = encl.Name
+			isMethod = true
 		}
 
 		// Create a unique key for the function
@@ -423,7 +637,7 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		}
 
 		// Extract calls from the body immediately (memory-optimized: don't store body)
-		calls := cg.extractCalls(body)
+		calls := cg.extractCalls(body, callSite{class: encl, aliases: p.aliases})
 
 		funcDef := &FunctionDef{
 			Name:      funcName,
@@ -435,13 +649,33 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		}
 
 		cg.mu.Lock()
-		cg.Functions[key] = funcDef
-		// Also store without class prefix for lookups
-		if className != "" && cg.Functions[funcName] == nil {
-			cg.Functions[funcName] = funcDef
+		// A qualified key is written once. Two files may declare the same class
+		// name -- 487 such names across 45 of 143 corpus trees -- and an
+		// unconditional write let the second silently replace the first's body.
+		// The loser is recorded as an ambiguous implementation instead, so both
+		// bodies stay reachable from the same key.
+		if prev, taken := cg.Functions[key]; !taken || prev == nil {
+			cg.Functions[key] = funcDef
 		}
 		if className != "" {
-			cg.CallsFrom[key] = calls
+			if _, taken := cg.CallsFrom[key]; !taken {
+				cg.CallsFrom[key] = calls
+			} else {
+				cg.addQualifiedAlias(key, funcName, filePath, calls, funcDef)
+			}
+		}
+
+		// Also store without class prefix for lookups.
+		//
+		// A method declared in a trait, interface or enum keeps the
+		// unconditional (last-writer) binding it had when those bodies were
+		// invisible and className was therefore empty. Moving it to the
+		// first-writer branch would change 860 bare-name bindings corpus-wide
+		// and, with them, which file a consumer reports as the declaration
+		// site: an answer that is exact today would become ambiguous. Nothing
+		// is gained by the move, so it is not made.
+		if className != "" && (encl.Kind != "class" || cg.Functions[funcName] == nil) {
+			cg.Functions[funcName] = funcDef
 		}
 
 		// DETERMINISM: track ambiguity when several definitions share a bare
@@ -455,25 +689,14 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		// under its qualified key would vanish from every call chain -- which is
 		// how it behaved before findClassRanges was fixed, when className was
 		// always empty and this branch happened to run for everything.
-		{
-			// Create a file-qualified key: "basename.php::funcName"
-			fileBase := filepath.Base(filePath)
-			fileQualifiedKey := fileBase + "::" + funcName
-			if _, alreadyExists := cg.CallsFrom[funcName]; alreadyExists {
-				// Collision: another definition already claimed this bare name
-				cg.AmbiguousFuncs[funcName] = append(cg.AmbiguousFuncs[funcName], fileQualifiedKey)
-				// Store the file-qualified version separately
-				if _, dup := cg.CallsFrom[fileQualifiedKey]; !dup {
-					cg.CallsFrom[fileQualifiedKey] = calls
-					cg.Functions[fileQualifiedKey] = funcDef
-				}
-			} else {
-				// First time seeing this bare name — store normally.
-				// Functions[funcName] is first-writer above, so both maps now
-				// agree on which definition the bare name denotes; they used to
-				// disagree, Functions being last-writer and CallsFrom first.
-				cg.CallsFrom[funcName] = calls
-			}
+		if _, alreadyExists := cg.CallsFrom[funcName]; alreadyExists {
+			cg.addQualifiedAlias(funcName, funcName, filePath, calls, funcDef)
+		} else {
+			// First time seeing this bare name — store normally.
+			// Functions[funcName] is first-writer above, so both maps now
+			// agree on which definition the bare name denotes; they used to
+			// disagree, Functions being last-writer and CallsFrom first.
+			cg.CallsFrom[funcName] = calls
 		}
 
 		for _, callee := range calls {
@@ -481,41 +704,194 @@ func (cg *PluginCallGraph) discoverFunctionsAndCalls(content, filePath string) {
 		}
 		cg.mu.Unlock()
 	}
+
+	cg.addTopLevelNode(content, filePath, decls, p)
 }
 
-// findClassRanges finds the start and end positions of all classes in content
-func findClassRanges(content string) map[string][2]int {
-	ranges := make(map[string][2]int)
-
-	matches := classDefPattern.FindAllStringSubmatchIndex(content, -1)
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
+// addQualifiedAlias files one implementation under a key that already has an
+// owner, so the loser of the collision stays reachable.
+//
+// The alias is "<basename>.php::<name>", the shape consumers already expect.
+// When that shape is taken too -- a third declaration of the same name in one
+// file, 1,722 declarations across 35 corpus trees -- the full path is used
+// instead, so no implementation is dropped. Caller must hold cg.mu.
+func (cg *PluginCallGraph) addQualifiedAlias(underKey, funcName, filePath string, calls []string, funcDef *FunctionDef) {
+	aliasKey := filepath.Base(filePath) + "::" + funcName
+	if _, taken := cg.CallsFrom[aliasKey]; taken {
+		base := filepath.ToSlash(filePath) + "::" + funcName
+		aliasKey = ""
+		for n := 2; n < 64; n++ {
+			cand := base + "#" + strconv.Itoa(n)
+			if _, taken := cg.CallsFrom[cand]; !taken {
+				aliasKey = cand
+				break
+			}
 		}
-
-		className := content[match[2]:match[3]]
-
-		// classDefPattern ends with `\s*\{`, so the match already consumes the
-		// class's own opening brace and match[1]-1 is its offset. Searching for
-		// the next "{" after the match found the first METHOD's brace instead,
-		// which made every recorded range one method body. No function
-		// declaration then fell inside any range, so className was empty for
-		// every function in every plugin and Class::method keys were never
-		// created.
-		openBrace := match[1] - 1
-		if openBrace < 0 || openBrace >= len(content) || content[openBrace] != '{' {
-			continue
+		if aliasKey == "" {
+			return
 		}
+	}
+	cg.CallsFrom[aliasKey] = calls
+	if _, taken := cg.Functions[aliasKey]; !taken {
+		cg.Functions[aliasKey] = funcDef
+	}
+	cg.AmbiguousFuncs[underKey] = append(cg.AmbiguousFuncs[underKey], aliasKey)
+}
 
-		// Find the matching closing brace
-		closeBrace := findMatchingBrace(content, openBrace)
-		if closeBrace < 0 {
-			continue
-		}
-
-		ranges[className] = [2]int{openBrace, closeBrace}
+// addTopLevelNode gives the file's load-time code a node in the call graph.
+//
+// PHP has no main(): every statement outside a function body runs when the file
+// is included or requested directly. That is where WordPress plugins bootstrap
+// -- instantiate the plugin object, call its init, register everything -- and
+// the graph had no node for it at all. So an include edge could only ever
+// produce file-level evidence, and a `direct` endpoint, whose callback IS a
+// file, resolved to nothing: 618 such endpoints across 77 of 143 corpus trees,
+// every one of them at level unauthenticated, contributing nothing to the
+// minimum privilege a function requires. Measured on three trees, 6 of 6, 2 of
+// 2 and 14 of 14 direct endpoints had a provably empty transitive call set.
+//
+// The body is the file with every declaration blanked out. Blanking must start
+// at the DECLARATION HEAD and not at the body brace: leaving `function foo(` in
+// place makes the declaration head itself read as a call, which inflates the
+// extracted set roughly threefold.
+//
+// The node is keyed by file path only. A basename key would be wrong: 164 of
+// the 618 direct-endpoint files, in 43 of 143 trees, share a basename with
+// another file in the same tree, and a first-writer map would then hand the
+// walk a different file's bootstrap.
+func (cg *PluginCallGraph) addTopLevelNode(content, filePath string, decls []FuncDecl, p *fileParse) {
+	loadTime := topLevelSource(content, decls)
+	if strings.TrimSpace(loadTime) == "" {
+		return
+	}
+	calls := cg.extractCalls(loadTime, callSite{aliases: p.aliases})
+	if len(calls) == 0 {
+		return
 	}
 
+	def := &FunctionDef{
+		Name:      topLevelName,
+		FilePath:  filePath,
+		StartLine: 1,
+		EndLine:   countNewlines(content),
+	}
+
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	for _, key := range topLevelKeys(filePath) {
+		if _, taken := cg.CallsFrom[key]; taken {
+			continue
+		}
+		cg.CallsFrom[key] = calls
+		cg.Functions[key] = def
+	}
+	for _, callee := range calls {
+		cg.CallsTo[callee] = append(cg.CallsTo[callee], filePath)
+	}
+}
+
+// topLevelName is the synthetic name a file's load-time code is given.
+const topLevelName = "__toplevel"
+
+// topLevelKeys are the call-graph keys a file's load-time node answers to. The
+// slash-normalised spelling is included because callers key their file maps by
+// whatever their platform produced.
+func topLevelKeys(filePath string) []string {
+	slashed := filepath.ToSlash(filePath)
+	if slashed == filePath {
+		return []string{filePath}
+	}
+	return []string{filePath, slashed}
+}
+
+// topLevelSource returns the file with every function declaration removed, head
+// included, leaving only the code that runs when the file is loaded.
+//
+// Removing must start at the DECLARATION HEAD and not at the body brace:
+// leaving `function foo(` behind makes the declaration head itself read as a
+// call, which inflates the extracted set roughly threefold.
+//
+// The remaining fragments are joined rather than blanked in place. Blanking
+// keeps the file's original length, so every pattern then scans megabytes of
+// spaces; joining scans only the load-time text, which is a small fraction of a
+// typical plugin file. A newline between fragments keeps two of them from
+// running together into a token that appears in neither.
+func topLevelSource(content string, decls []FuncDecl) string {
+	if len(decls) == 0 {
+		return content
+	}
+	var b strings.Builder
+	prev := 0
+	for _, d := range decls {
+		start, end := d.DeclStart, d.BodyClose
+		if start < prev || end > len(content) || start >= end {
+			continue
+		}
+		b.WriteString(content[prev:start])
+		b.WriteByte('\n')
+		prev = end
+	}
+	if prev < len(content) {
+		b.WriteString(content[prev:])
+	}
+	return b.String()
+}
+
+// linkTopLevelIncludes joins each file's load-time node to the load-time node
+// of every file it includes.
+//
+// followIncludes already propagates FILES along these edges. This gives the
+// same edges a function-level twin, so a chain that runs through a bootstrap
+// file -- `require_once __DIR__.'/lib.php'; boot();` -- is a chain the callee
+// walk can follow rather than a fact only the file walk knows.
+func (cg *PluginCallGraph) linkTopLevelIncludes(sortedPaths []string) {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	for _, fp := range sortedPaths {
+		includes := cg.IncludesFrom[fp]
+		if len(includes) == 0 {
+			continue
+		}
+		key := fp
+		existing, ok := cg.CallsFrom[key]
+		if !ok {
+			// A file whose load-time code calls nothing still includes other
+			// files, and what those files load at their own scope runs.
+			cg.Functions[key] = &FunctionDef{Name: topLevelName, FilePath: fp, StartLine: 1}
+		}
+		seen := make(map[string]bool, len(existing))
+		for _, c := range existing {
+			seen[c] = true
+		}
+		added := existing
+		for _, inc := range includes {
+			target := cg.resolveIncludePathLocked(inc)
+			if target == "" || target == fp || seen[target] {
+				continue
+			}
+			seen[target] = true
+			added = append(added, target)
+			cg.CallsTo[target] = append(cg.CallsTo[target], key)
+		}
+		if len(added) == len(existing) {
+			continue
+		}
+		sort.Strings(added)
+		for _, k := range topLevelKeys(fp) {
+			cg.CallsFrom[k] = added
+		}
+	}
+}
+
+// findClassRanges finds the start and end positions of all types in content.
+func findClassRanges(content string) map[string][2]int {
+	infos := findClassInfos(content)
+	ranges := make(map[string][2]int, len(infos))
+	for name := range infos {
+		ci := infos[name]
+		ranges[name] = [2]int{ci.Open, ci.Close}
+	}
 	return ranges
 }
 
@@ -600,17 +976,76 @@ func countNewlines(s string) int {
 	return strings.Count(s, "\n") + 1
 }
 
-// extractCalls extracts all function/method calls from a code block
-func (cg *PluginCallGraph) extractCalls(code string) []string {
+// callSite is what the language knows about the place a body was written: the
+// type that lexically encloses it, and the file-scoped `use ... as ...` renames
+// in effect there.
+//
+// PHP resolves a method call against the receiver, not against a global name
+// table. `$this->m()` inside class C calls the m that C resolves through its
+// own declaration, then its traits, then its parent; `self::m()` calls C's m;
+// `parent::m()` calls the m of C's declared parent. extractCalls had this
+// information available at the moment it ran -- discoverFunctionsAndCalls
+// computes the enclosing class before calling it -- and simply did not receive
+// it, so 214,687 intra-class dispatch sites across 140 of 143 corpus trees
+// emitted a bare name and resolved to whichever declaration sorted first.
+type callSite struct {
+	class   *classInfo
+	aliases map[string]string
+}
+
+// extractCalls extracts all function/method calls from a code block.
+//
+// A receiver-qualified token is emitted IN ADDITION to the bare one, never
+// instead of it. Two reasons, both measured. A bare name is the only spelling
+// some consumers have -- 18 of 43 exactly-correct benchmark answers rest on
+// evidence that is entirely unqualified tokens -- and `$this->m()` is LATE
+// bound in PHP: the runtime object may be a subclass whose override the
+// enclosing class's resolution order never reaches, so dropping the bare token
+// would make a genuinely reachable override unreachable.
+func (cg *PluginCallGraph) extractCalls(code string, site callSite) []string {
 	calls := make(map[string]bool)
+	enclosing := ""
+	if site.class != nil {
+		enclosing = site.class.Name
+	}
+
+	// alias records the token and, when its leading name was renamed by a
+	// file-scoped `use X as Y`, the same token under the imported name. Both
+	// are emitted: PHP scopes the alias to this file, and the call graph's keys
+	// carry no file, so rewriting instead of adding would break every OTHER
+	// file that names the same identifier without the import.
+	add := func(token string) {
+		calls[token] = true
+		if len(site.aliases) == 0 {
+			return
+		}
+		head, rest := token, ""
+		if i := strings.Index(token, "::"); i > 0 {
+			head, rest = token[:i], token[i:]
+		}
+		if target, ok := site.aliases[head]; ok {
+			calls[target+rest] = true
+		}
+	}
 
 	// Extract direct function calls
 	matches := directCallPattern.FindAllStringSubmatch(code, -1)
 	for _, match := range matches {
 		if len(match) > 1 {
 			name := match[1]
-			if !phpKeywords[name] && !wpCoreFunctions[name] {
-				calls[name] = true
+			// A PHP magic method is never a free function: the language invokes
+			// it through an object or through `parent::`. The bare token this
+			// pattern produces for `parent::__construct(` therefore names no
+			// one function, and following it reaches an arbitrary unrelated
+			// constructor. The receiver-qualified token carries the real edge.
+			if phpMagicMethods[name] {
+				continue
+			}
+			// A WordPress core name is skipped because there is nothing to
+			// recurse into -- unless the plugin declares a function of that
+			// name itself, in which case the call site is the only edge to it.
+			if !phpKeywords[name] && (!wpCoreFunctions[name] || cg.DeclaredNames[name]) {
+				add(name)
 			}
 		}
 	}
@@ -620,6 +1055,9 @@ func (cg *PluginCallGraph) extractCalls(code string) []string {
 	for _, match := range matches {
 		if len(match) > 1 {
 			calls["$this->"+match[1]] = true
+			if enclosing != "" {
+				calls[enclosing+"::"+match[1]] = true
+			}
 		}
 	}
 
@@ -635,23 +1073,94 @@ func (cg *PluginCallGraph) extractCalls(code string) []string {
 	matches = staticCallPattern.FindAllStringSubmatch(code, -1)
 	for _, match := range matches {
 		if len(match) > 2 {
-			calls[match[1]+"::"+match[2]] = true
+			recv, method := match[1], match[2]
+			add(recv + "::" + method)
+			switch recv {
+			case "self", "static":
+				// self:: is the enclosing class; static:: is that class or a
+				// subclass of it, so the enclosing class's resolution is a
+				// sound starting point and the bare token covers the rest.
+				if enclosing != "" {
+					calls[enclosing+"::"+method] = true
+				}
+			case "parent":
+				// parent:: was unresolvable in principle: the extends clause
+				// had no capture group, so no parent name existed anywhere in
+				// the graph. 8,330 parent:: call sites across 120 of 143 trees.
+				if site.class != nil && site.class.Parent != "" {
+					calls[site.class.Parent+"::"+method] = true
+				}
+			}
 		}
 	}
 
+	// Instantiation calls the constructor. `new Klass(...)` invokes
+	// Klass::__construct unconditionally -- that is the language, not a
+	// heuristic -- and WordPress plugins do their entire wiring in
+	// constructors. 29,955 `new` sites across 141 of 143 trees name a class
+	// that declares __construct in the same tree, and every one of those edges
+	// was missing.
+	for _, match := range findAllIfPresent(newInstancePattern, code, "new") {
+		name := lastNameSegment(match[1])
+		switch strings.ToLower(name) {
+		case "class":
+			// `new class { ... }` is an anonymous class: it names no type.
+			continue
+		case "self", "static":
+			name = enclosing
+		case "parent":
+			if site.class != nil {
+				name = site.class.Parent
+			} else {
+				name = ""
+			}
+		}
+		if name == "" {
+			continue
+		}
+		// The bare class token is what collectReachableFiles maps through
+		// ClassToFile, and the paren-less spelling never produced one.
+		add(name)
+		add(name + "::__construct")
+	}
+
+	// A method named by a variable: $this->$m(), $this->{$m}(), and
+	// call_user_func(array($this, $m)). The receiver is not unknown -- $this is
+	// an instance of the enclosing class -- so the target is one of that
+	// class's methods. Enumerating them is an exact over-approximation of an
+	// enumerable set, bounded by one class, rather than a guess about what the
+	// variable holds.
+	if enclosing != "" && strings.Contains(code, "$this") {
+		if thisVarMethodPattern.MatchString(code) {
+			cg.addClassMethodTokens(enclosing, "", calls)
+		}
+		for _, match := range callUserFuncThisVarPattern.FindAllStringSubmatch(code, -1) {
+			// A literal prefix bounds the set further: PHP string
+			// concatenation is prefix-preserving, so 'action' . $x can only
+			// name a method whose name starts with "action".
+			cg.addClassMethodTokens(enclosing, match[1], calls)
+		}
+	}
+
+	// A class named by a variable. PHP string concatenation is
+	// prefix-preserving: `"WPJP" . $x . "Controller"` can only ever produce a
+	// name beginning "WPJP" and ending "Controller", so the set of types it can
+	// name is bounded by the literal parts written at that very site.
+	cg.addVariableClassTokens(code, calls)
+
 	// Extract call_user_func callbacks
-	matches = callUserFuncPattern.FindAllStringSubmatch(code, -1)
+	matches = findAllIfPresent(callUserFuncPattern, code, "call_user_func")
 	for _, match := range matches {
 		for i := 1; i < len(match); i++ {
 			if match[i] != "" {
-				calls[match[i]] = true
+				add(match[i])
 				break
 			}
 		}
 	}
 
 	// Resolve do_action/apply_filters through hook registry
-	if cg.HookRegistry != nil {
+	if cg.HookRegistry != nil && firesAHook(code) {
 		hookMatches := wpHookCallPattern.FindAllStringSubmatch(code, -1)
 		for _, match := range hookMatches {
 			if len(match) > 1 {
@@ -700,6 +1209,245 @@ func (cg *PluginCallGraph) extractCalls(code string) []string {
 	sort.Strings(result)
 
 	return result
+}
+
+// nameShape is what a call site tells us about a class name it does not spell
+// out: either the exact name, or the literal prefix and suffix that every value
+// the expression can produce must carry.
+type nameShape struct {
+	Exact, Prefix, Suffix string
+}
+
+// addVariableClassTokens links `new $v(...)` and `$v::m(...)` to the types the
+// variable can name, when the variable was assigned a string with literal parts
+// in the same body.
+//
+// The bound is the literal, and the literal is read out of the call site's own
+// source -- never from a table of known prefixes, which would stop the rule
+// being universal.
+//
+// Matching is against the UNQUALIFIED type name, and a literal whose final
+// segment is a namespace separator constrains that name not at all: for
+// `'\Vendor\Pack\' . $x` the prefix contributes nothing, and matching it
+// against every type in the plugin would connect one call site to all of them.
+// Such a site is treated as unbounded and contributes nothing.
+func (cg *PluginCallGraph) addVariableClassTokens(code string, calls map[string]bool) {
+	newSites := findAllIfPresent(newVarPattern, code, "new $")
+	varStatic := findAllIfPresent(varStaticCallPattern, code, "::")
+	if len(newSites) == 0 && len(varStatic) == 0 {
+		return
+	}
+
+	shapes := map[string]nameShape{}
+	for _, m := range varAssignPattern.FindAllStringSubmatch(code, -1) {
+		if s, ok := shapeOfExpression(m[2]); ok {
+			// A variable reassigned in the same body could hold either value,
+			// so the widest shape is kept: an exact name loses to a pattern.
+			if prev, seen := shapes[m[1]]; seen && prev.Exact != "" && s.Exact == "" {
+				shapes[m[1]] = s
+			} else if !seen {
+				shapes[m[1]] = s
+			}
+		}
+	}
+	if len(shapes) == 0 {
+		return
+	}
+
+	emit := func(varName, method string) {
+		s, ok := shapes[varName]
+		if !ok {
+			return
+		}
+		for _, cls := range cg.typesMatching(s) {
+			calls[cls] = true
+			calls[cls+"::"+method] = true
+		}
+	}
+	for _, m := range newSites {
+		emit(m[1], "__construct")
+	}
+	for _, m := range varStatic {
+		emit(m[1], m[2])
+	}
+}
+
+// shapeOfExpression reads what a right-hand side guarantees about the string it
+// produces. It reports false when the expression guarantees nothing.
+func shapeOfExpression(expr string) (nameShape, bool) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" || strings.ContainsAny(expr, "()[]") {
+		// A call or a subscript can return anything.
+		return nameShape{}, false
+	}
+	folded := foldStringConcat(expr)
+	if isQuotedLiteral(folded) {
+		name := lastNameSegment(strings.Trim(folded, "'\""))
+		if name == "" {
+			return nameShape{}, false
+		}
+		return nameShape{Exact: name}, true
+	}
+	if !strings.Contains(expr, "$") || !strings.Contains(expr, ".") {
+		return nameShape{}, false
+	}
+
+	var s nameShape
+	if lit, ok := leadingLiteral(expr); ok {
+		// Only what follows the last namespace separator constrains the
+		// unqualified name.
+		s.Prefix = lastNameSegment(lit)
+	}
+	if lit, ok := trailingLiteral(expr); ok && !strings.Contains(lit, "\\") {
+		s.Suffix = lit
+	}
+	if len(s.Prefix) < 3 && len(s.Suffix) < 3 {
+		// One or two characters identify nothing; a site bounded only that
+		// loosely would match most of a plugin.
+		return nameShape{}, false
+	}
+	return s, true
+}
+
+func isQuotedLiteral(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	q := s[0]
+	return (q == '\'' || q == '"') && s[len(s)-1] == q &&
+		strings.IndexByte(s[1:len(s)-1], q) < 0
+}
+
+// leadingLiteral returns the literal a concatenation starts with.
+func leadingLiteral(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if len(expr) == 0 || (expr[0] != '\'' && expr[0] != '"') {
+		return "", false
+	}
+	end := skipString(expr, 0)
+	if end <= 0 {
+		return "", false
+	}
+	return expr[1:end], true
+}
+
+// trailingLiteral returns the literal a concatenation ends with.
+func trailingLiteral(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if len(expr) == 0 {
+		return "", false
+	}
+	q := expr[len(expr)-1]
+	if q != '\'' && q != '"' {
+		return "", false
+	}
+	for i := len(expr) - 2; i >= 0; i-- {
+		if expr[i] == q && (i == 0 || expr[i-1] != '\\') {
+			return expr[i+1 : len(expr)-1], true
+		}
+	}
+	return "", false
+}
+
+// typesMatching returns the declared types a name shape can denote. PHP type
+// names are case-insensitive, so the comparison folds case.
+func (cg *PluginCallGraph) typesMatching(s nameShape) []string {
+	cg.mu.RLock()
+	defer cg.mu.RUnlock()
+
+	if s.Exact != "" {
+		if name := cg.foldTypeLocked(s.Exact); name != "" {
+			return []string{name}
+		}
+		return nil
+	}
+	prefix, suffix := strings.ToLower(s.Prefix), strings.ToLower(s.Suffix)
+	var out []string
+	for name := range cg.Types {
+		l := strings.ToLower(name)
+		if len(l) < len(prefix)+len(suffix) {
+			continue
+		}
+		if strings.HasPrefix(l, prefix) && strings.HasSuffix(l, suffix) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// findAllIfPresent runs a pattern only when a literal substring the pattern
+// requires is present.
+//
+// A regexp engine with no literal prefix has to walk every byte; a substring
+// scan does not. The call graph runs a dozen patterns over every function body
+// in a plugin, and most bodies contain none of the constructs most of them look
+// for.
+func findAllIfPresent(pat *regexp.Regexp, code, must string) [][]string {
+	if !strings.Contains(code, must) {
+		return nil
+	}
+	return pat.FindAllStringSubmatch(code, -1)
+}
+
+// firesAHook reports whether code contains any hook firing at all.
+func firesAHook(code string) bool {
+	return strings.Contains(code, "do_action") || strings.Contains(code, "apply_filters")
+}
+
+// addClassMethodTokens emits one Class::method token for each method the class
+// declares -- through its traits and ancestors as well, which is the set PHP
+// itself would dispatch over -- optionally restricted to a literal prefix.
+//
+// The bound is one class's method list, so this cannot become the "matches
+// everything" rule: it links a call site to the methods of the receiver, which
+// is exactly what the language says the target must be.
+func (cg *PluginCallGraph) addClassMethodTokens(class, prefix string, calls map[string]bool) {
+	cg.mu.RLock()
+	defer cg.mu.RUnlock()
+
+	seen := make(map[string]bool, 4)
+	for name := cg.foldTypeLocked(class); name != "" && !seen[name]; {
+		seen[name] = true
+		td := cg.Types[name]
+		if td == nil {
+			return
+		}
+		for _, m := range td.Methods {
+			if prefix == "" || strings.HasPrefix(m, prefix) {
+				calls[name+"::"+m] = true
+			}
+		}
+		for _, t := range td.Traits {
+			tn := cg.foldTypeLocked(t)
+			if tn == "" || seen[tn] {
+				continue
+			}
+			seen[tn] = true
+			if tt := cg.Types[tn]; tt != nil {
+				for _, m := range tt.Methods {
+					if prefix == "" || strings.HasPrefix(m, prefix) {
+						calls[tn+"::"+m] = true
+					}
+				}
+			}
+		}
+		name = cg.foldTypeLocked(td.Parent)
+	}
+}
+
+// foldTypeLocked maps a type name to the spelling the graph indexed it under.
+// PHP type names are case-insensitive while the graph preserves the source's
+// case, so `extends WPForms_Field` must find a declaration of `WPForms_field`.
+// Caller must hold cg.mu.
+func (cg *PluginCallGraph) foldTypeLocked(name string) string {
+	if name == "" {
+		return ""
+	}
+	if _, ok := cg.Types[name]; ok {
+		return name
+	}
+	return cg.typeFold[strings.ToLower(name)]
 }
 
 // usableHookFragment decides whether a literal fragment of a composed hook name
@@ -815,17 +1563,22 @@ func (cg *PluginCallGraph) getCalleesRecursive(funcName string, visited map[stri
 // aliases are the qualified keys a bare name may denote. They are returned
 // separately because they are reachable functions in their own right and belong
 // in the callee set, not merely as a route to further edges.
+// phpMagicMethods are names the language itself defines. They carry no identity:
+// every class may declare __construct, and a plugin has hundreds. Merging every
+// same-named body for one of these turns a single token into a broadcast --
+// measured at 496 distinct names, 37% of the plugin, reached from the bare
+// `__construct` key of one 1,323-function tree.
+var phpMagicMethods = map[string]bool{
+	"__construct": true, "__destruct": true, "__call": true, "__callStatic": true,
+	"__get": true, "__set": true, "__isset": true, "__unset": true,
+	"__sleep": true, "__wakeup": true, "__serialize": true, "__unserialize": true,
+	"__toString": true, "__invoke": true, "__set_state": true, "__clone": true,
+	"__debugInfo": true,
+}
+
 func (cg *PluginCallGraph) outgoingCalls(name string) (calls []string, aliases []string) {
 	if name == "" {
 		return nil, nil
-	}
-	bare := name
-	if i := strings.LastIndex(name, "\\"); i >= 0 {
-		bare = name[i+1:]
-	}
-	method := bare
-	if i := strings.LastIndex(bare, "::"); i >= 0 {
-		method = bare[i+2:]
 	}
 
 	cg.mu.RLock()
@@ -841,14 +1594,7 @@ func (cg *PluginCallGraph) outgoingCalls(name string) (calls []string, aliases [
 		}
 	}
 	seenAlias := make(map[string]bool)
-
-	for _, key := range [3]string{name, bare, method} {
-		if key == "" {
-			continue
-		}
-		if cs, ok := cg.CallsFrom[key]; ok {
-			addCalls(cs)
-		}
+	addAliases := func(key string) {
 		for _, qual := range cg.AmbiguousFuncs[key] {
 			if seenAlias[qual] {
 				continue
@@ -860,7 +1606,145 @@ func (cg *PluginCallGraph) outgoingCalls(name string) (calls []string, aliases [
 			}
 		}
 	}
+
+	// A file's load-time node is keyed by path. Paths carry both separators and
+	// must not be split on "\" as a namespace would be.
+	if isFileKey(name) {
+		if cs, ok := cg.CallsFrom[name]; ok {
+			addCalls(cs)
+		} else if cs, ok := cg.CallsFrom[filepath.ToSlash(name)]; ok {
+			addCalls(cs)
+		}
+		return calls, aliases
+	}
+
+	bare := name
+	if i := strings.LastIndex(name, "\\"); i >= 0 {
+		bare = name[i+1:]
+	}
+	method := bare
+	receiver := ""
+	if i := strings.LastIndex(bare, "::"); i >= 0 {
+		receiver, method = bare[:i], bare[i+2:]
+	} else {
+		// A "$this->m" or "->m" token names a method with the receiver spelled
+		// out. Stripping the receiver is the same normalisation "::" already
+		// gets, and without it the token resolves to nothing at all -- which is
+		// the only edge a method whose name collides with a WordPress core
+		// function has, at 2,943 call sites across 74 of 143 corpus trees.
+		method = strings.TrimPrefix(strings.TrimPrefix(method, "$this"), "->")
+	}
+
+	// A token that names a receiver PHP binds is resolved against that
+	// receiver, and the same-name merge below is NOT applied to it. Without
+	// this gate the merge fires precisely where the language is exact: 30.1% of
+	// $this->m() sites name a method two or more classes declare, and 61.8% of
+	// those declare it in the enclosing class, so unioning would enter every
+	// other class's body for a call PHP resolves in one step.
+	if receiver != "" && receiver != "self" && receiver != "static" && receiver != "parent" {
+		if key := cg.resolveMethodKeyLocked(receiver, method); key != "" {
+			if cs, ok := cg.CallsFrom[key]; ok {
+				addCalls(cs)
+			}
+			addAliases(key)
+			return calls, aliases
+		}
+		// A constructor edge is exact or it is nothing. Falling back to the
+		// bare `__construct` key would hand every `new` in the plugin one
+		// arbitrary constructor, and under the same-name merge, all of them.
+		if phpMagicMethods[method] {
+			return calls, aliases
+		}
+	}
+
+	for _, key := range [3]string{name, bare, method} {
+		if key == "" {
+			continue
+		}
+		if cs, ok := cg.CallsFrom[key]; ok {
+			addCalls(cs)
+		}
+		if key == method && phpMagicMethods[method] {
+			// The bare magic name is a valid key but names no one function.
+			continue
+		}
+		addAliases(key)
+	}
 	return calls, aliases
+}
+
+// isFileKey reports whether a call-graph name is a file path rather than a
+// function name. PHP identifiers contain neither "/" nor ".".
+func isFileKey(name string) bool {
+	// A file-qualified alias such as "src/Repo.php::save" carries both a path
+	// and a function, and it is the function that must be resolved.
+	if strings.Contains(name, "::") {
+		return false
+	}
+	if strings.IndexByte(name, '/') >= 0 {
+		return true
+	}
+	if len(name) < 4 {
+		return false
+	}
+	tail := name[len(name)-4:]
+	return tail[0] == '.' &&
+		(tail[1] == 'p' || tail[1] == 'P') &&
+		(tail[2] == 'h' || tail[2] == 'H') &&
+		(tail[3] == 'p' || tail[3] == 'P')
+}
+
+// resolveMethodKeyLocked returns the CallsFrom key that Class::method denotes,
+// following PHP's method resolution order: the class's own declaration, then
+// each trait it uses in declaration order, then its parent, recursively.
+//
+// This is the ordering pkg/ast/inheritance.go already implements for the
+// tree-sitter path; it is copied rather than re-derived. The walk folds case
+// because PHP type names are case-insensitive, and it carries a visited set
+// because `class A extends B` / `class B extends A` occurs in broken vendor
+// trees. Caller must hold cg.mu.
+func (cg *PluginCallGraph) resolveMethodKeyLocked(class, method string) string {
+	// The overwhelmingly common case is a class that declares the method
+	// itself, so that lookup is tried before anything is allocated.
+	if _, ok := cg.CallsFrom[class+"::"+method]; ok {
+		return class + "::" + method
+	}
+	name := cg.foldTypeLocked(class)
+	if name == "" {
+		return ""
+	}
+	var seen []string
+	visited := func(n string) bool {
+		for _, s := range seen {
+			if s == n {
+				return true
+			}
+		}
+		// A cycle guard is needed because `class A extends B` /
+		// `class B extends A` occurs in broken vendor trees.
+		seen = append(seen, n)
+		return false
+	}
+	for name != "" && !visited(name) {
+		if _, ok := cg.CallsFrom[name+"::"+method]; ok {
+			return name + "::" + method
+		}
+		td := cg.Types[name]
+		if td == nil {
+			return ""
+		}
+		for _, t := range td.Traits {
+			tn := cg.foldTypeLocked(t)
+			if tn == "" || visited(tn) {
+				continue
+			}
+			if _, ok := cg.CallsFrom[tn+"::"+method]; ok {
+				return tn + "::" + method
+			}
+		}
+		name = cg.foldTypeLocked(td.Parent)
+	}
+	return ""
 }
 
 // GetCallers returns all functions that call the given callback
@@ -1002,61 +1886,120 @@ func AnalyzeCallbackInFile(fileContent, callback string) []string {
 	return ExtractFunctionCalls(body)
 }
 
-// lookupFunctionBody locates a function/method by name and returns its body
-// Memory-optimized: uses string operations instead of dynamic regex compilation
+// lookupFunctionBody locates a function/method by name and returns its body.
+//
+// The search used to be a literal scan for "function "+name, which missed
+// `function &name(` -- 50 sites across 19 of 143 corpus trees -- and
+// `function  name(` with more than one space, 68 sites across 28 trees, and
+// took the first textual hit even when the file declares two classes with a
+// same-named method. FindFunctionDeclarations answers all three, and it is the
+// same parse the graph itself is built from, so the two cannot disagree.
+//
+// When the name is qualified, a declaration inside the named class is preferred
+// over one merely sharing the method name.
 func lookupFunctionBody(content, funcName string) string {
-	// Handle Class::method format
 	methodOnly := funcName
+	className := ""
 	if idx := strings.LastIndex(funcName, "::"); idx >= 0 {
-		methodOnly = funcName[idx+2:]
+		className, methodOnly = funcName[:idx], funcName[idx+2:]
 	}
 
-	// Search for "function methodName" pattern using string operations
-	searchPattern := "function " + methodOnly
-	searchStart := 0
+	decls := declarationsNamed(content, methodOnly)
+	if len(decls) == 0 {
+		return ""
+	}
+	if len(decls) > 1 && className != "" {
+		// Only when the file declares the name more than once does it matter
+		// which class the declaration belongs to, and only then is the cost of
+		// finding the class ranges worth paying.
+		if ci, ok := findClassInfos(content)[className]; ok {
+			for i := range decls {
+				if decls[i].DeclStart > ci.Open && decls[i].DeclStart < ci.Close {
+					return content[decls[i].BodyOpen:decls[i].BodyClose]
+				}
+			}
+		}
+	}
+	return content[decls[0].BodyOpen:decls[0].BodyClose]
+}
 
-	for {
-		idx := strings.Index(content[searchStart:], searchPattern)
+// declarationsNamed finds every declaration of one function name in content.
+//
+// Scanning for the name and verifying backwards is what keeps this cheap: a
+// full FindFunctionDeclarations parse of the endpoint's file, run once per
+// endpoint, dominated the whole analysis on a plugin with many endpoints in one
+// file. Verifying backwards still accepts the spellings a literal
+// "function "+name search rejects -- `function &name(` and `function  name(`.
+func declarationsNamed(content, name string) []FuncDecl {
+	if name == "" {
+		return nil
+	}
+	var out []FuncDecl
+	for from := 0; ; {
+		idx := strings.Index(content[from:], name)
 		if idx < 0 {
-			return ""
+			return out
 		}
-		pos := searchStart + idx
+		pos := from + idx
+		from = pos + len(name)
 
-		// Verify this is followed by whitespace and '('
-		afterFunc := pos + len(searchPattern)
-		if afterFunc >= len(content) {
-			searchStart = afterFunc
+		// The match must be a whole identifier.
+		if pos > 0 && isTypeChar(content[pos-1]) {
+			continue
+		}
+		after := skipSpace(content, pos+len(name))
+		if after >= len(content) || content[after] != '(' {
 			continue
 		}
 
-		// Skip whitespace after function name
-		i := afterFunc
-		for i < len(content) && (content[i] == ' ' || content[i] == '\t' || content[i] == '\n' || content[i] == '\r') {
-			i++
+		// Walk back over optional whitespace and a by-reference "&" to the
+		// `function` keyword.
+		i := pos
+		for i > 0 && (content[i-1] == ' ' || content[i-1] == '\t' || content[i-1] == '\n' || content[i-1] == '\r') {
+			i--
 		}
-
-		// Must be followed by '('
-		if i >= len(content) || content[i] != '(' {
-			searchStart = i
+		if i > 0 && content[i-1] == '&' {
+			i--
+			for i > 0 && (content[i-1] == ' ' || content[i-1] == '\t') {
+				i--
+			}
+		}
+		const kw = "function"
+		if i < len(kw) || !strings.EqualFold(content[i-len(kw):i], kw) {
+			continue
+		}
+		if i-len(kw) > 0 && isTypeChar(content[i-len(kw)-1]) {
 			continue
 		}
 
-		// Find the opening brace after the parameter list
-		bracePos := strings.Index(content[i:], "{")
-		if bracePos < 0 {
-			searchStart = i
+		parenClose := matchDelimiter(content, after, '(', ')')
+		if parenClose < 0 {
 			continue
 		}
-
-		braceStart := i + bracePos
-
-		// Find matching closing brace
-		endPos := findMatchingBrace(content, braceStart)
-		if endPos < 0 {
-			return ""
+		j := skipSpace(content, parenClose+1)
+		if j < len(content) && content[j] == ':' {
+			j = skipSpace(content, j+1)
+			for j < len(content) && (isTypeChar(content[j]) || content[j] == '|' || content[j] == '?' || content[j] == '\\') {
+				j++
+			}
+			j = skipSpace(content, j)
 		}
-
-		return content[braceStart:endPos]
+		if j >= len(content) || content[j] != '{' {
+			// No body: an abstract method or an interface signature.
+			continue
+		}
+		bodyClose := findMatchingBrace(content, j)
+		if bodyClose < 0 {
+			continue
+		}
+		out = append(out, FuncDecl{
+			Name:      content[pos : pos+len(name)],
+			NameStart: pos,
+			DeclStart: i - len(kw),
+			BodyOpen:  j,
+			BodyClose: bodyClose,
+		})
+		from = bodyClose
 	}
 }
 
@@ -1090,8 +2033,10 @@ func EnrichEndpointsWithPluginCallGraph(endpoints []models.Endpoint, callGraph *
 			continue
 		}
 
-		// Get recursive calls using the plugin-wide call graph
-		calls := GetRecursiveCallsForCallback(callGraph, endpoints[i].Callback, fileContent)
+		// Get recursive calls using the plugin-wide call graph. The endpoint's
+		// own file is passed, because a callback that names a FILE rather than
+		// a function can only be resolved with it.
+		calls := GetRecursiveCallsForCallbackInFile(callGraph, endpoints[i].Callback, endpoints[i].File, fileContent)
 		if len(calls) > 0 {
 			endpoints[i].FunctionCalls = calls
 		}
@@ -1126,6 +2071,20 @@ func (cg *PluginCallGraph) closureSeededCalls(fileContent string) []string {
 // across the entire plugin codebase
 // Memory-optimized: uses pre-computed CallsFrom map instead of re-parsing bodies
 func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent string) []string {
+	return GetRecursiveCallsForCallbackInFile(cg, callback, "", fileContent)
+}
+
+// GetRecursiveCallsForCallbackInFile is GetRecursiveCallsForCallback told which
+// file the endpoint was found in.
+//
+// Some endpoints have no function for a callback at all. A `direct` endpoint is
+// a .php file an unauthenticated caller can request, and its callback is the
+// file's own name; a widget's is "Class::widget()", with the parentheses that
+// the "looks like an expression" guard rejects. Both resolved to an empty call
+// set for every plugin. The file path disambiguates the first, because 164 of
+// the 618 direct-endpoint files in the corpus share a basename with another
+// file in the same tree and a basename lookup would walk the wrong bootstrap.
+func GetRecursiveCallsForCallbackInFile(cg *PluginCallGraph, callback, endpointFile, fileContent string) []string {
 	if callback == "" || callback == "unknown" || callback == "inline" || callback == "closure" {
 		// An anonymous callback has no name to look up, but it does have a
 		// body, and that body is in the file this endpoint was found in.
@@ -1137,6 +2096,17 @@ func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent str
 
 	// Clean up the callback name
 	callback = ResolveCallback(callback, "")
+
+	// A callback written "Class::widget()" names a method, not an expression.
+	// Trimming the empty argument list before the guard below is what lets a
+	// widget endpoint resolve at all: 151 of them across 34 corpus trees, every
+	// one with an empty call set.
+	callback = strings.TrimSuffix(strings.TrimSpace(callback), "()")
+
+	// A callback that names a FILE is the file's load-time code.
+	if key := cg.topLevelKeyFor(callback, endpointFile); key != "" {
+		return cg.walkFrom(key)
+	}
 
 	// Skip if callback looks like a variable or expression
 	if strings.HasPrefix(callback, "$") || strings.Contains(callback, "(") {
@@ -1199,11 +2169,57 @@ func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent str
 	return allCalls
 }
 
+// topLevelKeyFor resolves a callback that names a file to that file's
+// load-time call-graph key, or "" when the callback does not name a file.
+//
+// The endpoint's own file is preferred, because it is unambiguous. A bare
+// basename is accepted only when exactly one file in the tree carries it --
+// the same rule resolveIncludePath already applies -- so an ambiguous name
+// resolves to nothing rather than to an arbitrary other file's bootstrap.
+func (cg *PluginCallGraph) topLevelKeyFor(callback, endpointFile string) string {
+	cg.mu.RLock()
+	defer cg.mu.RUnlock()
+
+	for _, cand := range [2]string{endpointFile, callback} {
+		if cand == "" || !strings.HasSuffix(strings.ToLower(cand), ".php") {
+			continue
+		}
+		if _, ok := cg.CallsFrom[cand]; ok {
+			return cand
+		}
+		norm := filepath.ToSlash(cand)
+		if _, ok := cg.CallsFrom[norm]; ok {
+			return norm
+		}
+		if real, ok := cg.normFiles[norm]; ok {
+			if _, ok := cg.CallsFrom[real]; ok {
+				return real
+			}
+		}
+		if paths := cg.FilesByBasename[filepath.Base(cand)]; len(paths) == 1 {
+			if _, ok := cg.CallsFrom[paths[0]]; ok {
+				return paths[0]
+			}
+		}
+	}
+	return ""
+}
+
+// walkFrom expands one call-graph key into its transitive callee set.
+func (cg *PluginCallGraph) walkFrom(key string) []string {
+	visited := map[string]bool{key: true}
+	allCalls := make([]string, 0, 16)
+	recurseCalls(cg, key, visited, &allCalls)
+	return allCalls
+}
+
 // recurseCalls recursively follows function calls through the plugin-wide index
 // Memory-optimized: uses pre-computed CallsFrom map instead of re-parsing bodies
 func recurseCalls(cg *PluginCallGraph, funcName string, visited map[string]bool, allCalls *[]string) {
-	// Don't recurse into PHP built-ins or WordPress core
-	if phpKeywords[funcName] || wpCoreFunctions[funcName] {
+	// Don't recurse into PHP built-ins, or into WordPress core unless the
+	// plugin declares a function of that name itself -- 730 such declarations
+	// across 102 of 143 corpus trees, whose bodies are otherwise unreachable.
+	if phpKeywords[funcName] || (wpCoreFunctions[funcName] && !cg.DeclaredNames[funcName]) {
 		return
 	}
 
@@ -1508,103 +2524,189 @@ func (cg *PluginCallGraph) parseComposerPSR4(content string) {
 	}
 }
 
-// extractClassToFileMap scans a PHP file for class definitions and namespace, then registers mappings.
-func (cg *PluginCallGraph) extractClassToFileMap(content, filePath string) {
-	classRanges := findClassRanges(content)
-	if len(classRanges) == 0 {
-		return
-	}
-
-	namespace := ""
-	if m := namespacePattern.FindStringSubmatch(content); len(m) > 1 {
-		namespace = m[1]
-	}
-
-	cg.mu.Lock()
-	for className := range classRanges {
-		cg.ClassToFile[className] = filePath
-		if namespace != "" {
-			fqn := namespace + "\\" + className
-			cg.ClassToFile[fqn] = filePath
-		}
-	}
-	cg.mu.Unlock()
-}
-
-// buildFileIndex builds a basename-to-paths index from ALL known PHP files.
+// buildFileIndex builds a basename-to-paths index from ALL known PHP files,
+// plus the separator-normalised index every path comparison uses.
+//
+// DETERMINISM: cg.AllFiles is a map, so the basename lists are sorted. Without
+// that, resolveIncludePath's single-candidate rule and resolveArgToFile's
+// suffix scan return whichever path the map iteration produced first.
 func (cg *PluginCallGraph) buildFileIndex() {
+	paths := make([]string, 0, len(cg.AllFiles))
 	for fp := range cg.AllFiles {
+		paths = append(paths, fp)
+	}
+	sort.Strings(paths)
+	for _, fp := range paths {
 		base := filepath.Base(fp)
 		cg.FilesByBasename[base] = append(cg.FilesByBasename[base], fp)
+		norm := filepath.ToSlash(fp)
+		if _, taken := cg.normFiles[norm]; !taken {
+			cg.normFiles[norm] = fp
+		}
 	}
 }
 
 // extractHookRegistrations scans a PHP file for add_action, add_filter, add_shortcode calls.
-func (cg *PluginCallGraph) extractHookRegistrations(content, filePath string) {
-	classRanges := findClassRanges(content)
+func (cg *PluginCallGraph) extractHookRegistrations(content, filePath string, p *fileParse) {
+	// Which hooks does this tree fire itself? A registration for a hook the
+	// tree never fires is not dead code: WordPress core, or another plugin,
+	// fires it during request handling. Recording the firings is what lets a
+	// consumer tell the two apart.
+	cg.recordFirings(content)
+
+	record := func(name string, reg HookRegistration, prefix bool) {
+		cg.HookRegistry.mu.Lock()
+		if prefix {
+			cg.HookRegistry.PrefixHooks[name] = append(cg.HookRegistry.PrefixHooks[name], reg)
+		} else {
+			cg.HookRegistry.Hooks[name] = append(cg.HookRegistry.Hooks[name], reg)
+		}
+		cg.HookRegistry.mu.Unlock()
+	}
+
+	register := func(hookName, callbackExpr string, at int, prefix bool) {
+		encl := enclosingType(at, p.types)
+		className := ""
+		if encl != nil {
+			className = encl.Name
+		}
+		if resolved := resolveHookCallback(callbackExpr, className); resolved != "" {
+			record(hookName, HookRegistration{
+				Callback: resolved, File: filePath, Hook: hookName,
+			}, prefix)
+			return
+		}
+		// `add_action( 'h', array( $this, $method ) )` names a method the
+		// language bounds to the enclosing class but does not spell out. The
+		// receiver is not unknown, so the enumerable set of possibilities is
+		// recorded rather than nothing at all -- 180 such sites across 63 of
+		// 143 corpus trees, and it is the only in-edge some AJAX handlers have.
+		if className == "" || !isVariableThisCallback(callbackExpr) {
+			return
+		}
+		for _, m := range cg.methodsOf(className) {
+			record(hookName, HookRegistration{
+				Callback: className + "::" + m, File: filePath, Hook: hookName,
+				Synthesized: true,
+			}, prefix)
+		}
+	}
 
 	// Static hook registrations: add_action('hook', callback)
 	for _, match := range hookRegistrationPattern.FindAllStringSubmatchIndex(content, -1) {
-		hookName := content[match[2]:match[3]]
-		callbackExpr := strings.TrimSpace(content[match[4]:match[5]])
-		className := findEnclosingClass(match[0], classRanges)
-
-		resolved := resolveHookCallback(callbackExpr, className)
-		if resolved == "" {
-			continue
-		}
-
-		cg.HookRegistry.mu.Lock()
-		cg.HookRegistry.Hooks[hookName] = append(cg.HookRegistry.Hooks[hookName], HookRegistration{
-			Callback: resolved,
-			File:     filePath,
-		})
-		cg.HookRegistry.mu.Unlock()
+		register(content[match[2]:match[3]], strings.TrimSpace(content[match[4]:match[5]]), match[0], false)
 	}
 
 	// Dynamic/concatenated hook registrations: add_action('prefix_' . $var, callback)
 	for _, match := range hookRegistrationDynamicPattern.FindAllStringSubmatchIndex(content, -1) {
-		prefix := content[match[2]:match[3]]
-		callbackExpr := strings.TrimSpace(content[match[4]:match[5]])
-		className := findEnclosingClass(match[0], classRanges)
-
-		resolved := resolveHookCallback(callbackExpr, className)
-		if resolved == "" {
-			continue
-		}
-
-		cg.HookRegistry.mu.Lock()
-		cg.HookRegistry.PrefixHooks[prefix] = append(cg.HookRegistry.PrefixHooks[prefix], HookRegistration{
-			Callback: resolved,
-			File:     filePath,
-		})
-		cg.HookRegistry.mu.Unlock()
+		register(content[match[2]:match[3]], strings.TrimSpace(content[match[4]:match[5]]), match[0], true)
 	}
 
 	// Shortcode registrations: add_shortcode('tag', callback)
 	for _, match := range shortcodeRegistrationPattern.FindAllStringSubmatchIndex(content, -1) {
-		tag := content[match[2]:match[3]]
-		callbackExpr := strings.TrimSpace(content[match[4]:match[5]])
-		className := findEnclosingClass(match[0], classRanges)
+		register("shortcode::"+content[match[2]:match[3]], strings.TrimSpace(content[match[4]:match[5]]), match[0], false)
+	}
+}
 
-		resolved := resolveHookCallback(callbackExpr, className)
-		if resolved == "" {
+// methodsOf returns the method names a type declares, through its traits and
+// ancestors.
+func (cg *PluginCallGraph) methodsOf(class string) []string {
+	calls := make(map[string]bool)
+	cg.addClassMethodTokens(class, "", calls)
+	out := make([]string, 0, len(calls))
+	for k := range calls {
+		if i := strings.LastIndex(k, "::"); i >= 0 {
+			out = append(out, k[i+2:])
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isVariableThisCallback reports whether a callback expression is the
+// `[$this, $method]` shape: an array whose object slot is $this and whose
+// method slot is not a literal.
+func isVariableThisCallback(expr string) bool {
+	if !strings.Contains(expr, "$this") {
+		return false
+	}
+	if !strings.Contains(expr, "[") && !strings.Contains(expr, "array") {
+		return false
+	}
+	rest := expr[strings.Index(expr, "$this")+len("$this"):]
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		return false
+	}
+	return strings.Contains(rest[comma:], "$")
+}
+
+// recordFirings notes every hook this file fires, so a consumer can tell a
+// registration the plugin dispatches itself from one only an outside
+// dispatcher can reach.
+func (cg *PluginCallGraph) recordFirings(content string) {
+	if !firesAHook(content) {
+		return
+	}
+	reg := cg.HookRegistry
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	for _, m := range wpHookCallPattern.FindAllStringSubmatch(content, -1) {
+		if len(m) > 1 {
+			reg.Fired[m[1]] = true
+		}
+	}
+	for _, pat := range [2]*regexp.Regexp{wpHookCallConcatPrefixPattern, wpHookCallInterpPrefixPattern} {
+		for _, m := range pat.FindAllStringSubmatch(content, -1) {
+			if len(m) > 1 {
+				reg.FiredPrefixes[m[1]] = true
+			}
+		}
+	}
+	// A firing whose name is a bare variable or a constant cannot be read at
+	// all. It is recorded as a caveat rather than ignored, because "the tree
+	// never fires this hook" is only sound if every firing was legible.
+	if wpHookCallOpaquePattern.MatchString(content) {
+		reg.FiredOpaque = true
+	}
+}
+
+// ExternalHookRoots returns the registrations whose hook name nothing in this
+// tree fires with a string literal.
+//
+// WordPress's whole extension model is that core, or another plugin, fires the
+// hook: 65% of the literal add_action/add_filter registrations in a 143-plugin
+// corpus name a hook the registering tree never fires. Such a callback is not
+// dead code, it is code an external dispatcher runs during request handling, so
+// it is an entry point. Root status is decided by exact literal firings alone:
+// a prefix inferred from `do_action( 'wp_' . $x )` would otherwise deny root
+// status to every wp_ajax_nopriv_ registration in the tree.
+//
+// The second return value reports that some firing in this tree could not be
+// read, so "never fired here" is a weaker statement than it looks.
+func (cg *PluginCallGraph) ExternalHookRoots() ([]HookRegistration, bool) {
+	cg.HookRegistry.mu.RLock()
+	defer cg.HookRegistry.mu.RUnlock()
+
+	var out []HookRegistration
+	names := make([]string, 0, len(cg.HookRegistry.Hooks))
+	for name := range cg.HookRegistry.Hooks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if cg.HookRegistry.Fired[name] || strings.HasPrefix(name, "shortcode::") {
 			continue
 		}
-
-		hookName := "shortcode::" + tag
-		cg.HookRegistry.mu.Lock()
-		cg.HookRegistry.Hooks[hookName] = append(cg.HookRegistry.Hooks[hookName], HookRegistration{
-			Callback: resolved,
-			File:     filePath,
-		})
-		cg.HookRegistry.mu.Unlock()
+		out = append(out, cg.HookRegistry.Hooks[name]...)
 	}
+	return out, cg.HookRegistry.FiredOpaque
 }
 
 // resolveHookCallback resolves a callback expression to a function/method name.
 func resolveHookCallback(expr, currentClass string) string {
-	expr = strings.TrimSpace(expr)
+	expr = foldStringConcat(strings.TrimSpace(expr))
 
 	// String callback: 'function_name'
 	if (strings.HasPrefix(expr, "'") || strings.HasPrefix(expr, "\"")) &&
@@ -1663,6 +2765,71 @@ func resolveHookCallback(expr, currentClass string) string {
 	return ""
 }
 
+// foldStringConcat joins adjacent string literals the way PHP does at compile
+// time, so `'ajax_' . 'WPBC_CREATE'` is the callback name ajax_WPBC_CREATE
+// rather than the literal text between the outer quotes.
+//
+// Only literal-to-literal joins are folded. An expression with a variable in it
+// names something this function cannot know, and is left alone for the caller
+// to reject.
+func foldStringConcat(expr string) string {
+	if !strings.Contains(expr, ".") {
+		return expr
+	}
+	var out strings.Builder
+	quote := byte(0)
+	i := 0
+	for i < len(expr) {
+		c := expr[i]
+		if quote == 0 && (c == '\'' || c == '"') {
+			if out.Len() == 0 {
+				out.WriteByte(c)
+				quote = c
+				i++
+				continue
+			}
+			// A second literal begins: drop the closing quote already written
+			// and this opening one, splicing the two literals together.
+			s := out.String()
+			if len(s) > 0 && s[len(s)-1] == c {
+				out.Reset()
+				out.WriteString(s[:len(s)-1])
+				quote = c
+				i++
+				continue
+			}
+			return expr
+		}
+		if quote != 0 {
+			if c == '\\' && i+1 < len(expr) {
+				out.WriteByte(c)
+				out.WriteByte(expr[i+1])
+				i += 2
+				continue
+			}
+			out.WriteByte(c)
+			if c == quote {
+				quote = 0
+			}
+			i++
+			continue
+		}
+		// Between literals only "." and whitespace may appear; anything else
+		// means the expression is not a pure literal join.
+		if c != '.' && c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+			return expr
+		}
+		i++
+	}
+	if quote != 0 {
+		return expr
+	}
+	if out.Len() == 0 {
+		return expr
+	}
+	return out.String()
+}
+
 // findEnclosingClass determines which class (if any) contains a given byte position.
 func findEnclosingClass(pos int, classRanges map[string][2]int) string {
 	className := ""
@@ -1679,38 +2846,80 @@ func findEnclosingClass(pos int, classRanges map[string][2]int) string {
 	return className
 }
 
-// discoverTraitUsage finds `use TraitName;` inside class bodies and aliases
-// the trait's methods as class methods in the call graph.
-func (cg *PluginCallGraph) discoverTraitUsage(content string, classRanges map[string][2]int) {
-	matches := traitUsePattern.FindAllStringSubmatchIndex(content, -1)
-	for _, match := range matches {
-		traitList := content[match[2]:match[3]]
-		className := findEnclosingClass(match[0], classRanges)
-		if className == "" {
+// discoverTraitUsage aliases the methods a type gets from its traits onto that
+// type, so `Bootstrap::send_password_reset` exists when Bootstrap uses the
+// trait that declares it.
+//
+// `use T;` inside a class body copies T's methods into the class at compile
+// time, and a method the class declares itself takes precedence over the
+// trait's. The own-declaration guard below is that precedence rule and must be
+// kept.
+//
+// The previous implementation could never fire, because a trait body was not a
+// class range and no `Trait::method` key was ever created. It also scanned the
+// whole of CallsFrom for every `use` statement in every file -- 739 trait uses
+// against 8,959 keys in one corpus tree -- and INSERTED into the map it was
+// ranging over, which Go leaves unspecified. It is driven off the per-type
+// method index instead, and the writes are collected before any is applied.
+func (cg *PluginCallGraph) discoverTraitUsage() {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	type alias struct {
+		classKey string
+		traitKey string
+	}
+	var pending []alias
+
+	names := make([]string, 0, len(cg.Types))
+	for name := range cg.Types {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		td := cg.Types[name]
+		// A trait may itself use a trait, so the walk runs to a fixed point.
+		// Four rounds is past any real depth and stops a cycle from spinning.
+		seen := map[string]bool{name: true}
+		frontier := append([]string(nil), td.Traits...)
+		for round := 0; round < 4 && len(frontier) > 0; round++ {
+			var next []string
+			for _, t := range frontier {
+				tn := cg.foldTypeLocked(t)
+				if tn == "" || seen[tn] {
+					continue
+				}
+				seen[tn] = true
+				tt := cg.Types[tn]
+				if tt == nil {
+					continue
+				}
+				for _, m := range tt.Methods {
+					pending = append(pending, alias{classKey: name + "::" + m, traitKey: tn + "::" + m})
+				}
+				next = append(next, tt.Traits...)
+			}
+			frontier = next
+		}
+	}
+
+	for _, a := range pending {
+		if _, hasOwn := cg.CallsFrom[a.classKey]; hasOwn {
 			continue
 		}
-
-		traits := strings.Split(traitList, ",")
-		for _, trait := range traits {
-			traitName := strings.TrimSpace(trait)
-			if idx := strings.LastIndex(traitName, "\\"); idx >= 0 {
-				traitName = traitName[idx+1:]
+		calls, ok := cg.CallsFrom[a.traitKey]
+		if !ok {
+			continue
+		}
+		cg.CallsFrom[a.classKey] = calls
+		if funcDef, ok := cg.Functions[a.traitKey]; ok {
+			if _, taken := cg.Functions[a.classKey]; !taken {
+				cg.Functions[a.classKey] = funcDef
 			}
-
-			cg.mu.Lock()
-			for key, calls := range cg.CallsFrom {
-				if strings.HasPrefix(key, traitName+"::") {
-					methodName := key[len(traitName)+2:]
-					classKey := className + "::" + methodName
-					if _, hasOwn := cg.CallsFrom[classKey]; !hasOwn {
-						cg.CallsFrom[classKey] = calls
-						if funcDef, ok := cg.Functions[key]; ok {
-							cg.Functions[classKey] = funcDef
-						}
-					}
-				}
-			}
-			cg.mu.Unlock()
+		}
+		for _, callee := range calls {
+			cg.CallsTo[callee] = append(cg.CallsTo[callee], a.classKey)
 		}
 	}
 }
@@ -1772,21 +2981,24 @@ func (cg *PluginCallGraph) collectReachableFiles(funcName string, visited map[st
 		}
 	}
 
-	// Resolve class-to-file for Class::method patterns
-	if idx := strings.Index(bareName, "::"); idx > 0 {
-		className := bareName[:idx]
-		if file, ok := cg.ClassToFile[className]; ok {
-			reachable[file] = true
+	// Resolve type-to-file for Class::method patterns.
+	//
+	// ClassToFiles rather than ClassToFile: a name may be declared in several
+	// files, and the single-valued map keeps only one of them. Reading the
+	// many-valued index means recognising more type declarations can only add
+	// file reach.
+	markFiles := func(name string) {
+		for _, f := range cg.ClassToFiles[name] {
+			reachable[f] = true
 		}
+	}
+	if idx := strings.Index(bareName, "::"); idx > 0 {
+		markFiles(bareName[:idx])
 	}
 	// Also check bare name as a class (from `new ClassName()` calls)
-	if file, ok := cg.ClassToFile[bareName]; ok {
-		reachable[file] = true
-	}
+	markFiles(bareName)
 	if bareName != funcName {
-		if file, ok := cg.ClassToFile[funcName]; ok {
-			reachable[file] = true
-		}
+		markFiles(funcName)
 	}
 	// PSR-4 autoload resolution for namespaced references (uses locked state)
 	if strings.Contains(funcName, "\\") {
@@ -1856,7 +3068,7 @@ func (cg *PluginCallGraph) followIncludes(reachable map[string]bool) {
 
 		for _, inc := range cg.IncludesFrom[current] {
 			// Always try to resolve to an actual file in the plugin
-			resolved := cg.resolveIncludePath(inc)
+			resolved := cg.resolveIncludePathLocked(inc)
 			if resolved != "" {
 				if !reachable[resolved] {
 					reachable[resolved] = true
@@ -1873,6 +3085,23 @@ func (cg *PluginCallGraph) followIncludes(reachable map[string]bool) {
 
 // resolveIncludePath tries to match an include path to a known file via basename + suffix matching.
 func (cg *PluginCallGraph) resolveIncludePath(path string) string {
+	cg.mu.RLock()
+	defer cg.mu.RUnlock()
+	return cg.resolveIncludePathLocked(path)
+}
+
+// resolveIncludePathLocked is resolveIncludePath with cg.mu already held.
+//
+// Both sides of the comparison are separator-normalised and the ORIGINAL key is
+// returned. Include paths inside PHP source are written with forward slashes
+// while the files map is keyed by whatever the caller's platform produced --
+// absolute OS paths in production, filepath.Rel output in the benchmark, both
+// with backslashes on Windows. So the suffix test could never fire there and
+// resolution silently degraded to "exactly one file has this basename":
+// measured on one tree, 315 resolved include edges instead of 349, and 89
+// endpoint-reachable files instead of 98.
+func (cg *PluginCallGraph) resolveIncludePathLocked(path string) string {
+	path = filepath.ToSlash(path)
 	path = strings.TrimPrefix(path, "/")
 	path = strings.TrimPrefix(path, "./")
 	base := filepath.Base(path)
@@ -1880,7 +3109,8 @@ func (cg *PluginCallGraph) resolveIncludePath(path string) string {
 
 	// Try exact suffix match first
 	for _, candidate := range candidates {
-		if strings.HasSuffix(candidate, "/"+path) || candidate == path {
+		norm := filepath.ToSlash(candidate)
+		if strings.HasSuffix(norm, "/"+path) || norm == path {
 			return candidate
 		}
 	}
@@ -1903,8 +3133,15 @@ func (cg *HookRegistry) allHookCallbackFiles() []HookRegistration {
 	return all
 }
 
-// wpCoreHTTPHooks are WordPress hooks that fire on every HTTP request.
+// wpCoreHTTPHooks are WordPress CORE hooks that fire on every HTTP request.
 // Callbacks registered for these are implicitly reachable.
+//
+// The list used to name hooks belonging to three specific third-party plugins.
+// Those are not WordPress semantics, and they are no longer needed: a
+// registration for a hook this tree never fires is now recognised as externally
+// dispatched by set difference, which covers any plugin's hooks without naming
+// one. What remains is core's own request lifecycle, kept because a tree that
+// DOES fire one of these itself would otherwise drop out of the derived set.
 var wpCoreHTTPHooks = map[string]bool{
 	"plugins_loaded": true, "muplugins_loaded": true,
 	"init": true, "wp_loaded": true, "wp": true,
@@ -1915,9 +3152,6 @@ var wpCoreHTTPHooks = map[string]bool{
 	"wp_enqueue_scripts": true, "admin_enqueue_scripts": true,
 	"widgets_init": true, "after_setup_theme": true,
 	"shutdown": true, "wp_ajax_": true,
-	"woocommerce_init": true, "woocommerce_loaded": true,
-	"elementor/widgets/register": true, "elementor/init": true,
-	"acf/init": true, "acf/include_field_types": true,
 }
 
 // GetAllHTTPReachableFiles returns files reachable from detected endpoints AND
@@ -1933,10 +3167,17 @@ func (cg *PluginCallGraph) GetAllHTTPReachableFiles(endpoints []models.Endpoint)
 		}
 	}
 
-	// Start from WordPress core hooks — callbacks registered for these are always reachable
+	// Start from hooks nothing in this tree fires, and from core's request
+	// lifecycle.
+	//
+	// WordPress's extension model is that core, or another plugin, fires the
+	// hook: 65% of the literal registrations in a 143-plugin corpus name a hook
+	// the registering tree never fires. Such a callback is run by an external
+	// dispatcher during request handling, so its code is reachable, and the set
+	// is computed from the tree itself rather than from a list of hook names.
 	cg.HookRegistry.mu.RLock()
 	for hookName, regs := range cg.HookRegistry.Hooks {
-		if wpCoreHTTPHooks[hookName] {
+		if wpCoreHTTPHooks[hookName] || (!cg.HookRegistry.Fired[hookName] && !strings.HasPrefix(hookName, "shortcode::")) {
 			for _, reg := range regs {
 				hookReachable := cg.GetReachableFiles(reg.Callback, reg.File)
 				for f := range hookReachable {
@@ -2018,15 +3259,26 @@ func (cg *PluginCallGraph) GetAllHTTPReachableFiles(endpoints []models.Endpoint)
 	// Strategy: Class reference coverage
 	// Any class referenced in the call graph that maps to a file is reachable
 	cg.mu.RLock()
-	for className, classFile := range cg.ClassToFile {
-		if reachable[classFile] {
+	// ClassToFiles rather than ClassToFile, so a name declared in several files
+	// pulls in all of them instead of whichever one the single-valued map kept.
+	for className, classFiles := range cg.ClassToFiles {
+		allReachable := true
+		for _, f := range classFiles {
+			if !reachable[f] {
+				allReachable = false
+				break
+			}
+		}
+		if allReachable {
 			continue
 		}
 		// Check if any reachable function references this class
 		for funcName := range cg.Functions {
 			if strings.HasPrefix(funcName, className+"::") {
 				if def := cg.Functions[funcName]; def != nil && reachable[def.FilePath] {
-					reachable[classFile] = true
+					for _, f := range classFiles {
+						reachable[f] = true
+					}
 					break
 				}
 			}
@@ -2131,41 +3383,51 @@ func (cg *PluginCallGraph) GetAllHTTPReachableFiles(endpoints []models.Endpoint)
 // --- Dynamic includer detection and function-arg-to-file resolution ---
 
 // extractDynIncluders scans for functions whose body contains variable includes.
-func (cg *PluginCallGraph) extractDynIncluders(content, filePath string) {
-	classRanges := findClassRanges(content)
-	matches := funcDefPattern.FindAllStringSubmatchIndex(content, -1)
-
-	for _, match := range matches {
-		if len(match) < 4 {
-			continue
-		}
-		funcName := content[match[2]:match[3]]
-		bodyStart := match[1] - 1
-		endPos := findMatchingBrace(content, bodyStart)
-		if endPos < 0 {
-			continue
-		}
-		body := content[bodyStart:endPos]
-
+//
+// The declaration scan used to be funcDefPattern, whose regex parameter list
+// `\([^)]*\)` stops at the first ")" inside the parameters. A template loader
+// is normally written `function load_view( $name, $args = array() )`, so the
+// commonest shape of the very construct this function looks for was invisible:
+// 11,696 of 329,198 declarations across the corpus, 26% of one plugin's.
+// FindFunctionDeclarations walks the delimiters instead, which is why every
+// other consumer already moved to it.
+func (cg *PluginCallGraph) extractDynIncluders(content, filePath string, p *fileParse) {
+	for _, decl := range p.decls {
+		body := content[decl.BodyOpen:decl.BodyClose]
 		if !dynamicIncludeVarPattern.MatchString(body) {
 			continue
 		}
 
-		className := findEnclosingClass(match[0], classRanges)
-		key := funcName
-		if className != "" {
-			key = className + "::" + funcName
+		key := decl.Name
+		if encl := enclosingType(decl.DeclStart, p.types); encl != nil {
+			key = encl.Name + "::" + decl.Name
 		}
 
 		hints := extractDirHints(body, filePath)
 
+		// Hints are UNIONED, not replaced. Two includers sharing a bare name
+		// collide on this map, and recognising more of them makes that more
+		// likely; overwriting would take away a directory that is covered
+		// today, which is the one way this change could remove reachability.
 		cg.mu.Lock()
-		cg.DynIncluders[key] = hints
-		if className != "" {
-			cg.DynIncluders[funcName] = hints
+		cg.DynIncluders[key] = unionHints(cg.DynIncluders[key], hints)
+		if key != decl.Name {
+			cg.DynIncluders[decl.Name] = unionHints(cg.DynIncluders[decl.Name], hints)
 		}
 		cg.mu.Unlock()
 	}
+}
+
+func unionHints(existing, add []string) []string {
+	if len(existing) == 0 {
+		return add
+	}
+	for _, h := range add {
+		if !containsName(existing, h) {
+			existing = append(existing, h)
+		}
+	}
+	return existing
 }
 
 func extractDirHints(body, filePath string) []string {
@@ -2235,28 +3497,53 @@ func (cg *PluginCallGraph) resolveArgToFile(arg string, dirHints []string) strin
 			return paths[0]
 		}
 
+		// Every comparison normalises the stored key, because the caller's keys
+		// carry OS separators while the candidate is built from PHP source.
 		normalizedCandidate := filepath.ToSlash(candidate)
 		for _, hint := range dirHints {
 			suffixPath := filepath.ToSlash(filepath.Join(hint, normalizedCandidate))
 			for _, p := range paths {
-				if strings.HasSuffix(p, "/"+suffixPath) || p == suffixPath {
+				if n := filepath.ToSlash(p); strings.HasSuffix(n, "/"+suffixPath) || n == suffixPath {
 					return p
 				}
 			}
 			for _, p := range paths {
-				if strings.HasSuffix(p, "/"+normalizedCandidate) {
+				if strings.HasSuffix(filepath.ToSlash(p), "/"+normalizedCandidate) {
 					return p
 				}
 			}
 		}
 
-		for fp := range cg.AllFiles {
-			if strings.HasSuffix(fp, "/"+normalizedCandidate) || fp == normalizedCandidate {
-				return fp
+		// DETERMINISM: normFiles is built from a sorted path list, so the first
+		// suffix match is the same on every run. Ranging over the AllFiles map
+		// returned whichever key the hash order produced.
+		if real, ok := cg.normFiles[normalizedCandidate]; ok {
+			return real
+		}
+		for _, norm := range cg.sortedNormPaths() {
+			if strings.HasSuffix(norm, "/"+normalizedCandidate) {
+				return cg.normFiles[norm]
 			}
 		}
 	}
 	return ""
+}
+
+// fileByNormPath looks a candidate path up in the separator-normalised index
+// and returns the key AllFiles actually holds. Caller must hold cg.mu.
+func (cg *PluginCallGraph) fileByNormPath(path string) string {
+	return cg.normFiles[filepath.ToSlash(path)]
+}
+
+// sortedNormPaths returns every known file's normalised path in sorted order.
+// Caller must hold cg.mu.
+func (cg *PluginCallGraph) sortedNormPaths() []string {
+	out := make([]string, 0, len(cg.normFiles))
+	for n := range cg.normFiles {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (cg *PluginCallGraph) extractAutoloadHints(content, filePath string) {
@@ -2294,21 +3581,21 @@ func (cg *PluginCallGraph) resolvePSR4Locked(fqn string) string {
 	// Try namespace-to-directory (PSR-4): Vendor\Package\Class -> Vendor/Package/Class.php
 	relPath := strings.ReplaceAll(fqn, "\\", "/") + ".php"
 
+	// The candidate is built with forward slashes while AllFiles is keyed by
+	// whatever the caller's platform produced, so the lookup goes through the
+	// normalised index and returns the key the caller would recognise.
 	for _, baseDir := range cg.AutoloadBaseDirs {
-		candidate := filepath.ToSlash(filepath.Join(baseDir, relPath))
-		if cg.AllFiles[candidate] {
-			return candidate
+		if hit := cg.fileByNormPath(filepath.Join(baseDir, relPath)); hit != "" {
+			return hit
 		}
 		if idx := strings.Index(relPath, "/"); idx > 0 {
 			stripped := relPath[idx+1:]
-			candidate = filepath.ToSlash(filepath.Join(baseDir, stripped))
-			if cg.AllFiles[candidate] {
-				return candidate
+			if hit := cg.fileByNormPath(filepath.Join(baseDir, stripped)); hit != "" {
+				return hit
 			}
 			if idx2 := strings.Index(stripped, "/"); idx2 > 0 {
-				candidate = filepath.ToSlash(filepath.Join(baseDir, stripped[idx2+1:]))
-				if cg.AllFiles[candidate] {
-					return candidate
+				if hit := cg.fileByNormPath(filepath.Join(baseDir, stripped[idx2+1:])); hit != "" {
+					return hit
 				}
 			}
 		}
@@ -2324,7 +3611,7 @@ func (cg *PluginCallGraph) resolvePSR4Locked(fqn string) string {
 		for segs := len(parts); segs >= 2; segs-- {
 			suffix := strings.Join(parts[len(parts)-segs:], "/")
 			for _, p := range paths {
-				if strings.HasSuffix(p, "/"+suffix) || p == suffix {
+				if n := filepath.ToSlash(p); strings.HasSuffix(n, "/"+suffix) || n == suffix {
 					return p
 				}
 			}
@@ -2335,9 +3622,8 @@ func (cg *PluginCallGraph) resolvePSR4Locked(fqn string) string {
 	if strings.Contains(fqn, "_") && !strings.Contains(fqn, "\\") {
 		underscorePath := strings.ReplaceAll(fqn, "_", "/") + ".php"
 		for _, baseDir := range cg.AutoloadBaseDirs {
-			candidate := filepath.ToSlash(filepath.Join(baseDir, underscorePath))
-			if cg.AllFiles[candidate] {
-				return candidate
+			if hit := cg.fileByNormPath(filepath.Join(baseDir, underscorePath)); hit != "" {
+				return hit
 			}
 		}
 		// Also try with "classes/" prefix (common Visualizer pattern)
@@ -2350,7 +3636,7 @@ func (cg *PluginCallGraph) resolvePSR4Locked(fqn string) string {
 			for segs := len(uParts); segs >= 2; segs-- {
 				suffix := strings.Join(uParts[len(uParts)-segs:], "/")
 				for _, p := range paths {
-					if strings.HasSuffix(p, "/"+suffix) || p == suffix {
+					if n := filepath.ToSlash(p); strings.HasSuffix(n, "/"+suffix) || n == suffix {
 						return p
 					}
 				}
