@@ -196,3 +196,78 @@ func TestGetAllCapabilityMappingsAgreesWithGetCapabilityLevel(t *testing.T) {
 		}
 	}
 }
+
+// TestEditPagesIsEditor pins the capability that defines the Editor level.
+// populate_roles_160() grants edit_pages to administrator and editor and to no
+// lower role. It was absent from the table entirely, so it missed the exact
+// lookup, matched no prefix heuristic and came back at the Subscriber floor --
+// which is why the analyzer could barely produce Editor at all.
+func TestEditPagesIsEditor(t *testing.T) {
+	cfg := New()
+
+	level, ok := cfg.GetCapabilityLevel("edit_pages")
+	if !ok {
+		t.Fatal("edit_pages should be found in the table")
+	}
+	if level != models.Editor {
+		t.Errorf("edit_pages: got %s, want editor", level)
+	}
+
+	// The bound. edit_pages raises a level, so the neighbouring names that core
+	// assigns lower must not be dragged up with it: populate_roles_160() gives
+	// edit_posts to the contributor role and _210 gives edit_published_posts to
+	// the author role.
+	for capability, want := range map[string]models.AuthLevel{
+		"edit_posts":           models.Contributor,
+		"edit_published_posts": models.Author,
+		"edit_page":            models.Editor,
+	} {
+		got, ok := cfg.GetCapabilityLevel(capability)
+		if !ok {
+			t.Errorf("%s should be found", capability)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: got %s, want %s", capability, got, want)
+		}
+	}
+}
+
+// TestNumericUserLevels pins the legacy level_N ladder to populate_roles_160(),
+// which gives administrator level_10..level_0, editor level_7..level_0, author
+// level_2..level_0, contributor level_1..level_0 and subscriber level_0. The
+// lowest role holding level_N is what fixes its level.
+func TestNumericUserLevels(t *testing.T) {
+	cfg := New()
+
+	want := map[string]models.AuthLevel{
+		// The bound: level_0 is the subscriber role's own level and must not rise.
+		"level_0":  models.Subscriber,
+		"level_1":  models.Contributor,
+		"level_2":  models.Author,
+		"level_3":  models.Editor,
+		"level_4":  models.Editor,
+		"level_5":  models.Editor,
+		"level_6":  models.Editor,
+		"level_7":  models.Editor,
+		"level_8":  models.Admin,
+		"level_9":  models.Admin,
+		"level_10": models.Admin,
+	}
+
+	for capability, expected := range want {
+		got, ok := cfg.GetCapabilityLevel(capability)
+		if !ok {
+			t.Errorf("%s should be found in the table", capability)
+			continue
+		}
+		if got != expected {
+			t.Errorf("%s: got %s, want %s", capability, got, expected)
+		}
+	}
+
+	// level_11 does not exist in core, so it must not be invented.
+	if _, ok := cfg.GetCapabilityLevel("level_11"); ok {
+		t.Error("level_11 is not a WordPress capability and should not be in the table")
+	}
+}

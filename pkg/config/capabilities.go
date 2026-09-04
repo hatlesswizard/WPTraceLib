@@ -108,6 +108,21 @@ func wordPressCoreAdminCapabilities() []string {
 		"remove_users",
 		"update_core",
 
+		// The legacy numeric user levels. populate_roles_160() gives the
+		// administrator role level_10 down to level_0, the editor role level_7
+		// down, the author role level_2 down, the contributor role level_1 down
+		// and the subscriber role level_0, so the lowest role holding level_N is
+		// what fixes its level. level_8 and above are administrator-only.
+		// WP_User::has_cap() still routes a numeric capability argument through
+		// translate_level_to_cap(), so these names remain live.
+		//
+		// They occur in 0 of the 143 measured trees; this is the table being
+		// complete rather than a measured win, and like edit_pages these entries
+		// raise a level rather than lower one.
+		"level_8",
+		"level_9",
+		"level_10",
+
 		// Additional admin capabilities
 		"customize",
 		"edit_dashboard",
@@ -162,6 +177,22 @@ func wordPressCoreEditorCapabilities() []string {
 		"read_private_pages",
 		"publish_pages",
 
+		// edit_pages is granted to administrator and editor by
+		// populate_roles_160() and to no lower role. It is the capability that
+		// DEFINES the Editor level in core, and it was absent from this table
+		// entirely: it missed the exact lookup, matched no prefix heuristic, and
+		// came back at the Subscriber floor. 19 of the 143 measured trees check
+		// it.
+		//
+		// This entry raises a level, which is the one direction that can
+		// manufacture an over-restriction, so state the residual plainly: Editor
+		// is core's assignment, and a plugin that re-grants edit_pages to a lower
+		// or custom role -- get_role('subscriber')->add_cap('edit_pages') in an
+		// activation hook -- is not detected here and will read over-restrictive.
+		// Nothing static recovers that; it needs an index of the capabilities a
+		// tree grants. No such grant exists anywhere in the 143 trees measured.
+		"edit_pages",
+
 		// delete_pages is granted to administrator and editor by
 		// populate_roles_210(). It was missing from this table entirely, so it fell
 		// through to the "delete_" prefix heuristic and was reported Admin -- an
@@ -184,6 +215,14 @@ func wordPressCoreEditorCapabilities() []string {
 		// an editor passes look like an administrator gate, in 23 of the 143
 		// measured plugin trees.
 		"unfiltered_html",
+
+		// Legacy numeric user levels: populate_roles_160() gives the editor role
+		// level_7 down to level_0, and no lower role receives level_3 or above.
+		"level_3",
+		"level_4",
+		"level_5",
+		"level_6",
+		"level_7",
 
 		// Meta capabilities (singular forms) - pages and terms require Editor
 		"edit_page",    // Meta cap: page editing requires Editor level
@@ -214,6 +253,10 @@ func wordPressCoreAuthorCapabilities() []string {
 		"edit_published_posts",
 		"delete_published_posts",
 
+		// Legacy numeric user level: populate_roles_160() gives the author role
+		// level_2 and no lower role receives it.
+		"level_2",
+
 		// Meta capabilities (singular forms)
 		"publish_post", // Meta cap: publishing requires Author level
 	}
@@ -227,6 +270,10 @@ func wordPressCoreContributorCapabilities() []string {
 		// edit_posts and populate_roles_210() delete_posts to the contributor role.
 		"edit_posts",
 		"delete_posts",
+
+		// Legacy numeric user level: populate_roles_160() gives the contributor
+		// role level_1 and no lower role receives it.
+		"level_1",
 
 		// Meta capabilities (singular forms) - resolved to base level for static analysis
 		// Without runtime context, we map to the least restrictive interpretation
