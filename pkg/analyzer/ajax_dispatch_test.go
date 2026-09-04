@@ -24,8 +24,8 @@ func levelOf(eps []models.Endpoint, route string) (models.AuthLevel, bool) {
 	return level, found
 }
 
-// callbacksFor returns every callback reported for one route.
-func callbacksFor(eps []models.Endpoint, route string) []string {
+// callbackListFor returns every callback reported for one route.
+func callbackListFor(eps []models.Endpoint, route string) []string {
 	out := []string{}
 	for _, ep := range eps {
 		if ep.Route == route {
@@ -35,8 +35,11 @@ func callbacksFor(eps []models.Endpoint, route string) []string {
 	return out
 }
 
-func hasCallback(eps []models.Endpoint, route, callback string) bool {
-	for _, cb := range callbacksFor(eps, route) {
+// routeHasCallback checks a callback against ONE route. widget_test.go has a
+// hasCallback that checks the whole endpoint list regardless of route; the two
+// grew in parallel worktrees and only shared a name.
+func routeHasCallback(eps []models.Endpoint, route, callback string) bool {
+	for _, cb := range callbackListFor(eps, route) {
 		if strings.EqualFold(cb, callback) {
 			return true
 		}
@@ -387,8 +390,8 @@ class T {
 		if level != want.level {
 			t.Errorf("route %q reports %s, want %s", want.route, level, want.level)
 		}
-		if !hasCallback(eps, want.route, want.callback) {
-			t.Errorf("route %q callbacks = %v, want %q", want.route, callbacksFor(eps, want.route), want.callback)
+		if !routeHasCallback(eps, want.route, want.callback) {
+			t.Errorf("route %q callbacks = %v, want %q", want.route, callbackListFor(eps, want.route), want.callback)
 		}
 	}
 }
@@ -431,7 +434,7 @@ class A {
 }
 `
 	eps := DetectAJAXEndpoints(content, "a.php", "testplugin")
-	if !hasCallback(eps, "wp-admin/admin-ajax.php?action=mls_export_users", "this::export_users") {
+	if !routeHasCallback(eps, "wp-admin/admin-ajax.php?action=mls_export_users", "this::export_users") {
 		t.Errorf("add_filter registration was not seen; got %+v", eps)
 	}
 }
@@ -467,8 +470,8 @@ class A {
 			t.Errorf("route %q produced no endpoint; got %+v", route, eps)
 			continue
 		}
-		if !hasCallback(eps, route, want) {
-			t.Errorf("route %q callbacks = %v, want %q", route, callbacksFor(eps, route), want)
+		if !routeHasCallback(eps, route, want) {
+			t.Errorf("route %q callbacks = %v, want %q", route, callbackListFor(eps, route), want)
 		}
 	}
 }
@@ -491,8 +494,8 @@ class L {
 }
 `
 	eps := DetectAJAXEndpoints(content, "a.php", "testplugin")
-	if !hasCallback(eps, "wp-admin/admin-ajax.php?action=do_x", "do_thing") {
-		t.Errorf("the loader's method name was lost; callbacks = %v", callbacksFor(eps, "wp-admin/admin-ajax.php?action=do_x"))
+	if !routeHasCallback(eps, "wp-admin/admin-ajax.php?action=do_x", "do_thing") {
+		t.Errorf("the loader's method name was lost; callbacks = %v", callbackListFor(eps, "wp-admin/admin-ajax.php?action=do_x"))
 	}
 	for _, ep := range eps {
 		if strings.Contains(ep.Callback, "$") {
@@ -524,8 +527,8 @@ function ajax_AAA() { echo $_POST['x']; }
 	if level != models.Unauthenticated {
 		t.Errorf("level = %s, want unauthenticated", level)
 	}
-	if !hasCallback(eps, "wp-admin/admin-ajax.php?action=AAA", "ajax_AAA") {
-		t.Errorf("callbacks = %v, want ajax_AAA", callbacksFor(eps, "wp-admin/admin-ajax.php?action=AAA"))
+	if !routeHasCallback(eps, "wp-admin/admin-ajax.php?action=AAA", "ajax_AAA") {
+		t.Errorf("callbacks = %v, want ajax_AAA", callbackListFor(eps, "wp-admin/admin-ajax.php?action=AAA"))
 	}
 	for _, ep := range eps {
 		if strings.ContainsAny(ep.Callback, "'\".") {
@@ -543,8 +546,8 @@ func TestArrayCallbackWithConcatenatedMethodIsFolded(t *testing.T) {
 add_action('wp_ajax_avail', array($this, 'ajax_' . 'AVAIL'));
 `
 	eps := DetectAJAXEndpoints(content, "a.php", "testplugin")
-	if !hasCallback(eps, "wp-admin/admin-ajax.php?action=avail", "this::ajax_AVAIL") {
-		t.Errorf("callbacks = %v, want this::ajax_AVAIL", callbacksFor(eps, "wp-admin/admin-ajax.php?action=avail"))
+	if !routeHasCallback(eps, "wp-admin/admin-ajax.php?action=avail", "this::ajax_AVAIL") {
+		t.Errorf("callbacks = %v, want this::ajax_AVAIL", callbackListFor(eps, "wp-admin/admin-ajax.php?action=avail"))
 	}
 }
 
@@ -586,8 +589,8 @@ function bp_legacy_theme_messages_send_reply() { echo $_POST['id']; }
 		if level != models.Unauthenticated {
 			t.Errorf("route %q reports %s, want unauthenticated: the loop registers a nopriv half", route, level)
 		}
-		if !hasCallback(eps, route, want) {
-			t.Errorf("route %q callbacks = %v, want %q -- the handler is the table's VALUE", route, callbacksFor(eps, route), want)
+		if !routeHasCallback(eps, route, want) {
+			t.Errorf("route %q callbacks = %v, want %q -- the handler is the table's VALUE", route, callbackListFor(eps, route), want)
 		}
 	}
 }
@@ -611,8 +614,8 @@ function boot() {
 		"wp-admin/admin-ajax.php?action=act_one": "cb_act_one",
 		"wp-admin/admin-ajax.php?action=act_two": "cb_act_two",
 	} {
-		if !hasCallback(eps, route, want) {
-			t.Errorf("route %q callbacks = %v, want %q", route, callbacksFor(eps, route), want)
+		if !routeHasCallback(eps, route, want) {
+			t.Errorf("route %q callbacks = %v, want %q", route, callbackListFor(eps, route), want)
 		}
 	}
 	for _, ep := range eps {
@@ -647,8 +650,8 @@ function wpbc_ajax_TWO() {}
 			t.Errorf("emitted a phantom endpoint %q taken from a table VALUE", ep.Route)
 		}
 	}
-	if !hasCallback(eps, "wp-admin/admin-ajax.php?action=ONE", "wpbc_ajax_ONE") {
-		t.Errorf("callbacks = %v, want wpbc_ajax_ONE", callbacksFor(eps, "wp-admin/admin-ajax.php?action=ONE"))
+	if !routeHasCallback(eps, "wp-admin/admin-ajax.php?action=ONE", "wpbc_ajax_ONE") {
+		t.Errorf("callbacks = %v, want wpbc_ajax_ONE", callbackListFor(eps, "wp-admin/admin-ajax.php?action=ONE"))
 	}
 }
 
@@ -688,8 +691,8 @@ class Ajax {
 		if level != models.Unauthenticated {
 			t.Errorf("route %q reports %s, want unauthenticated", route, level)
 		}
-		if !hasCallback(eps, route, want) {
-			t.Errorf("route %q callbacks = %v, want %q", route, callbacksFor(eps, route), want)
+		if !routeHasCallback(eps, route, want) {
+			t.Errorf("route %q callbacks = %v, want %q", route, callbackListFor(eps, route), want)
 		}
 	}
 }
@@ -738,8 +741,8 @@ class AJAX {
 	if level != models.Unauthenticated {
 		t.Errorf("route %q reports %s, want unauthenticated", route, level)
 	}
-	if !hasCallback(eps, route, "__CLASS__::register_member") {
-		t.Errorf("route %q callbacks = %v, want __CLASS__::register_member", route, callbacksFor(eps, route))
+	if !routeHasCallback(eps, route, "__CLASS__::register_member") {
+		t.Errorf("route %q callbacks = %v, want __CLASS__::register_member", route, callbackListFor(eps, route))
 	}
 }
 
@@ -763,8 +766,8 @@ function boot() {
 		"wp-admin/admin-ajax.php?action=post_update": "post_update",
 		"wp-admin/admin-ajax.php?action=get_more":    "get_more",
 	} {
-		if !hasCallback(eps, route, want) {
-			t.Errorf("route %q callbacks = %v, want the fallback %q", route, callbacksFor(eps, route), want)
+		if !routeHasCallback(eps, route, want) {
+			t.Errorf("route %q callbacks = %v, want the fallback %q", route, callbackListFor(eps, route), want)
 		}
 	}
 	for _, ep := range eps {

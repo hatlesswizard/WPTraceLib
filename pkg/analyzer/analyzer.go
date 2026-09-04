@@ -565,6 +565,24 @@ func (a *Analyzer) readFileContent(filepath string) (string, error) {
 
 // enrichEndpointsRecursively enriches all endpoints with recursive call graph analysis (flat list)
 func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callGraph *PluginCallGraph, fileContents map[string]string, pluginDir string) {
+	// Memoise on (callback, file), the way the hierarchical variant below has
+	// always memoised on the callback.
+	//
+	// Without it this runs one full recursive walk per endpoint, and endpoints
+	// share callbacks constantly -- several routes on one handler, a widget's
+	// render and admin faces, a dispatch table registering twenty actions
+	// against one method. That was tolerable while a plugin reported tens of
+	// endpoints. The discovery fixes took one corpus plugin from 81 endpoints to
+	// 212 and the direct pass corpus-wide from 618 to 2334, so the same
+	// redundancy is now several times more expensive, and the walk itself became
+	// wider when it started resolving ambiguous names and hook families.
+	//
+	// The result depends only on the callback and the file its body is looked up
+	// in, so the key is exact rather than an approximation: two endpoints with
+	// the same pair cannot have different answers.
+	type callKey struct{ callback, file string }
+	memo := make(map[callKey][]string)
+
 	for i := range endpoints {
 		if endpoints[i].Callback == "" {
 			continue
@@ -572,6 +590,13 @@ func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callG
 
 		// Get the file content for this endpoint
 		fullPath := filepath.Join(pluginDir, endpoints[i].File)
+		if calls, ok := memo[callKey{endpoints[i].Callback, fullPath}]; ok {
+			if len(calls) > 0 {
+				endpoints[i].FunctionCalls = calls
+			}
+			continue
+		}
+
 		content, ok := fileContents[fullPath]
 		if !ok {
 			// Try to read the file
@@ -585,6 +610,7 @@ func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callG
 
 		// Get recursive calls using the plugin-wide call graph
 		calls := GetRecursiveCallsForCallback(callGraph, endpoints[i].Callback, content)
+		memo[callKey{endpoints[i].Callback, fullPath}] = calls
 		if len(calls) > 0 {
 			endpoints[i].FunctionCalls = calls
 		}

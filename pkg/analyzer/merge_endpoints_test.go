@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hatlesswizard/wptracelib/pkg/models"
@@ -104,10 +105,25 @@ class P {
 	})
 
 	const route = "wp-admin/admin-ajax.php?action=do_thing"
-	cbs := callbacksFor(eps, route)
+
+	// Compare on the method, not on the whole callback string. This test is
+	// about whether BOTH arms survive the merge, and the receiver's spelling is
+	// not what it is asserting. The AJAX rewrite began reporting
+	// array($this,'m') as "this::m" rather than "m", which changes nothing that
+	// matters: every walk strips the prefix before looking a name up, and the
+	// benchmark's CleanCallback does the same, so both spellings resolve to the
+	// same graph key. Pinning the spelling here would make an unrelated
+	// normalisation change look like a lost endpoint.
+	methods := map[string]bool{}
+	for cb := range callbacksFor(eps, route) {
+		if i := strings.LastIndex(cb, "::"); i >= 0 {
+			cb = cb[i+2:]
+		}
+		methods[cb] = true
+	}
 	for _, want := range []string{"handle_admin", "handle_public"} {
-		if !cbs[want] {
-			t.Errorf("callback %q has no endpoint; the route's records are %v", want, cbs)
+		if !methods[want] {
+			t.Errorf("callback %q has no endpoint; the route's records are %v", want, methods)
 		}
 	}
 

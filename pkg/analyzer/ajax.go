@@ -3146,9 +3146,11 @@ func splitTopLevelConcat(expr string) []string {
 
 func isPHPDigit(b byte) bool { return b >= '0' && b <= '9' }
 
-func isPHPNameByte(b byte) bool {
-	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
-}
+// isPHPNameByte lives in wrappers.go. The copy that stood here omitted the
+// high-byte range, and a PHP identifier is
+// [a-zA-Z_-ÿ][a-zA-Z0-9_-ÿ]*, so a non-ASCII action or method
+// name was not recognised as one. Using the correct alphabet widens what is
+// matched, which is the direction that finds more endpoints.
 
 // foldPHPExpr evaluates a PHP string expression to the value PHP would build.
 //
@@ -3658,7 +3660,7 @@ func foldArrayCallable(expr string, subst map[string]string, content, scope stri
 		inner = strings.Join(args, ",")
 	}
 	parts := make([]string, 0, 2)
-	for _, part := range splitTopLevelArgs(inner) {
+	for _, part := range splitUnwrappedArgs(inner) {
 		if strings.TrimSpace(part) != "" {
 			parts = append(parts, part)
 		}
@@ -3675,9 +3677,10 @@ func foldArrayCallable(expr string, subst map[string]string, content, scope stri
 	return "array(" + strings.TrimSpace(parts[0]) + ", '" + method + "')", true
 }
 
-// splitTopLevelArgs splits an already-unwrapped argument list on top-level
-// commas.
-func splitTopLevelArgs(inner string) []string {
+// splitUnwrappedArgs splits an already-unwrapped argument list on top-level
+// commas. guard.go has its own splitUnwrappedArgs which takes a masked copy of
+// the text alongside it; they are different algorithms and only shared a name.
+func splitUnwrappedArgs(inner string) []string {
 	parts := make([]string, 0, 2)
 	depth := 0
 	start := 0
@@ -4310,7 +4313,7 @@ func arrayLiteralPairs(expr string) ([][2]string, bool) {
 	}
 
 	pairs := make([][2]string, 0, 8)
-	for _, element := range splitTopLevelArgs(inner) {
+	for _, element := range splitUnwrappedArgs(inner) {
 		element = strings.TrimSpace(element)
 		if element == "" {
 			continue

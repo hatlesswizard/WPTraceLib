@@ -22,9 +22,17 @@ func init() {
 
 // SetAuthConfig sets the authentication configuration.
 // This allows customizing capability mappings and admin patterns.
+//
+// The AST path is configured from here too. pkg/ast used to carry its own
+// hard-coded copy of the capability table, which meant an embedder that supplied
+// a capability map configured one of the two paths and silently not the other,
+// and the two disagreed. The duplicate table is gone; this is the one line that
+// makes the surviving table reach both, and it belongs here because pkg/ast
+// cannot import pkg/config's plumbing from anywhere else in the call chain.
 func SetAuthConfig(cfg *config.Config) {
 	if cfg != nil {
 		authConfig = cfg
+		wpast.SetCapabilityConfig(cfg)
 	}
 }
 
