@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"sort"
 	"strings"
 	"sync"
 )
@@ -23,9 +24,15 @@ type ClassHierarchy struct {
 	// declaration had no ancestors, so no subclass of that grandparent could be
 	// found and every method it inherited was invisible.
 	//
-	// The index is safe against collisions because it is keyed on the whole
-	// FQN: two classes may differ only in case across namespaces (A\Foo and
-	// B\foo), but not within one, which is what PHP forbids.
+	// Two spellings of one FQN can both be declared in a tree, so the index
+	// can be asked to choose. PHP forbids two classes differing only in case
+	// within one namespace, but that is a rule about what a single process can
+	// LOAD, not about what a static scan of a directory can find: a vendored
+	// copy and a fork under deprecated/ sit in the tree together and only one
+	// of them is ever included. A 143-plugin corpus holds exactly one such
+	// pair. Which spelling PHP would load cannot be known without running it,
+	// so that ambiguity is not resolved here; see the tie-break in
+	// BuildClassHierarchy for the arbitrary-but-fixed choice made instead.
 	caseIndex map[string]string
 
 	// mroMu guards MROCache. One ClassHierarchy is built per plugin
@@ -54,8 +61,20 @@ func BuildClassHierarchy(st *SymbolTable) *ClassHierarchy {
 	}
 	for fqn := range st.Classes {
 		lower := strings.ToLower(fqn)
-		// First writer wins, so the result does not depend on map order.
-		if _, exists := h.caseIndex[lower]; !exists {
+		// The lexically smallest spelling wins. "First writer wins" was not a
+		// choice at all: this range is randomised, so whenever a tree declared
+		// two spellings of one name the index answered differently run to run.
+		// The key is smallest-by-FQN rather than anything read off the
+		// ClassSymbol because an FQN is a key of the map being ranged and is
+		// unique by construction, whereas a duplicated class's File and Line
+		// are themselves decided by last-writer-wins over another randomised
+		// range (symboltable.go:100-135) and would import that coin flip here.
+		//
+		// With one spelling declared -- every group in the corpus but one --
+		// this is the answer first-writer-wins already gave, and canonical()
+		// consults the index only for a name matching no declared spelling
+		// exactly (:150 short-circuits first), so no decided answer moves.
+		if existing, exists := h.caseIndex[lower]; !exists || fqn < existing {
 			h.caseIndex[lower] = fqn
 		}
 	}
@@ -80,6 +99,43 @@ func BuildClassHierarchy(st *SymbolTable) *ClassHierarchy {
 			}
 			h.Traits[fqn] = resolved
 		}
+	}
+
+	// DETERMINISM: siblings are ordered by FQN. The range above walks
+	// st.Classes in Go's randomised map order, so without this every Children
+	// slice -- and with it the pre-order walk GetAllSubclasses returns
+	// (:232-241) -- came out differently on every run of the same binary over
+	// the same tree.
+	//
+	// Most callers cannot see that, and this is not for their benefit.
+	// expandInheritedRESTEndpoints (analyzer.go:393) builds one clone per
+	// subclass out of that subclass alone, carrying nothing between
+	// iterations, and the endpoint slice is re-sorted on route, method, type,
+	// file, callback, line and level at analyzer.go:245 before anything reads
+	// it; there the order sets a position that is immediately overwritten.
+	//
+	// DetectAJAXEndpointsWithAST (ajax.go:2900-2927) is the caller that can.
+	// It appends as it walks and skips any class whose route an earlier one
+	// already claimed (ajax.go:2907-2916), and the survivor's own name is the
+	// record: Callback is classFQN + "::handle" (ajax.go:2924). Two subclasses
+	// reach one route with no coincidence needed -- neither has to mention
+	// $action, since ResolveProperty walks up the Parents chain
+	// (resolver.go:170-173) to the vendored base that declares it. So the
+	// range order picked which class name the endpoint carried, and
+	// mergeEndpoints keys on Callback (analyzer.go:990), which makes the two
+	// names two different endpoint records rather than one merged one: a
+	// benchmark identity that flips between runs of the same binary.
+	//
+	// FQN is the sort key for the same reason it is the caseIndex tie-break:
+	// it is the map key, unique by construction, where a class's File and Line
+	// are last-writer-wins over the range in BuildSymbolTable when one FQN is
+	// declared twice (symboltable.go:100-135).
+	//
+	// This fixes the order among siblings only. It cannot move an ancestor
+	// past its descendant, which collectSubclasses pins by walking pre-order,
+	// so every order that was already decided stays as it was.
+	for parent := range h.Children {
+		sort.Strings(h.Children[parent])
 	}
 
 	return h

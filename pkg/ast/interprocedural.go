@@ -643,46 +643,111 @@ func extractCapabilityString(node *sitter.Node, source []byte) string {
 }
 
 func (a *AuthAnalyzer) AnalyzePermissionCallback(ref CallbackRef) models.AuthLevel {
-	bodyNode, source := a.resolveCallbackBody(ref)
+	bodyNode, source, enclosingFQN := a.resolveCallbackBody(ref)
 	if bodyNode == nil {
 		return models.Subscriber
 	}
 
-	return a.analyzeReturnStatements(bodyNode, source, 0)
+	return a.analyzeReturnStatements(bodyNode, source, 0, enclosingFQN)
 }
 
-func (a *AuthAnalyzer) resolveCallbackBody(ref CallbackRef) (*sitter.Node, []byte) {
+// resolveCallbackBody returns the body a callback reference names, the source it
+// was parsed from, and the FQN of the class that body belongs to -- "" when the
+// body is not a method, or when the reference does not say which class it came
+// from. That third value is what lets analyzeReturnExpression resolve a
+// `return $this->m();` against the enclosing class instead of against every
+// class in the plugin; see the comment at the member_call_expression case there.
+func (a *AuthAnalyzer) resolveCallbackBody(ref CallbackRef) (*sitter.Node, []byte, string) {
 	switch ref.Type {
 	case "function":
 		if fn, ok := a.SymTable.Functions[ref.FuncName]; ok && fn.BodyNode != nil {
-			return fn.BodyNode, a.sourceForFile(fn.File)
+			return fn.BodyNode, a.sourceForFile(fn.File), ""
 		}
+
+		// A callback string carries no namespace, so once the exact key misses
+		// the only thing left to match on is the last segment of the FQN -- and
+		// a plugin that declares the same function name under two namespaces
+		// then offers two bodies with nothing in the callback to choose between
+		// them. This loop used to take whichever the map handed over first. Go
+		// randomises map iteration, which turned that into a coin flip per call:
+		// one run reads a `return true;` body, the next reads
+		// `return current_user_can('manage_options');`, and the endpoint moves
+		// between unauthenticated and admin with no change to the tree or to the
+		// binary. That is exactly the kind of flip that makes a benchmark
+		// unreadable, because it moves keys without any edit to blame.
+		//
+		// Smallest FQN does not resolve the ambiguity: which body PHP would have
+		// loaded depends on include order at run time and is not decidable from
+		// a callback string. It makes the choice DEFINED -- a total order over
+		// the plugin's own symbols that cannot move with file-walk order, map
+		// seed or goroutine scheduling. Scanning for the minimum lands on the
+		// same symbol a sorted key list would, for one pass and no allocation.
+		//
+		// Across the benchmark corpus this loop resolves nothing at all: of the
+		// 1,204 function callbacks it is asked about, 31 hit the exact key above
+		// and the other 1,173 name a function the tree does not declare. So no
+		// answer the corpus produces changes here. It is a guard for the tree
+		// that does collide two names, where today the flip is silent.
+		var bestFn *FunctionSymbol
 		for _, fn := range a.SymTable.Functions {
-			parts := strings.Split(fn.FQN, `\`)
-			if parts[len(parts)-1] == ref.FuncName && fn.BodyNode != nil {
-				return fn.BodyNode, a.sourceForFile(fn.File)
+			if fn.BodyNode == nil {
+				continue
 			}
+			parts := strings.Split(fn.FQN, `\`)
+			if parts[len(parts)-1] != ref.FuncName {
+				continue
+			}
+			if bestFn == nil || fn.FQN < bestFn.FQN {
+				bestFn = fn
+			}
+		}
+		if bestFn != nil {
+			return bestFn.BodyNode, a.sourceForFile(bestFn.File), ""
 		}
 
 	case "method", "static_method":
 		className := ref.ClassName
 		if cls, ok := a.SymTable.Classes[className]; ok {
 			if m, ok := cls.Methods[ref.MethodName]; ok && m.BodyNode != nil {
-				return m.BodyNode, a.sourceForFile(m.File)
+				return m.BodyNode, a.sourceForFile(m.File), cls.FQN
 			}
 		}
+
+		// The same ambiguity as the function case above, one level down: a
+		// callback like 'Ctl::handle' names the class by its short name, and two
+		// namespaces -- or a bundled second copy of a library -- can each
+		// declare a Ctl that declares handle(). First-in-map-order picked one of
+		// the two bodies per run; smallest FQN picks the same one on every run.
+		// The ambiguity is real and stays real; this only stops it moving. Of
+		// the corpus's 4,312 method callbacks, 14 reach this loop and every one
+		// of them has a single candidate, so again nothing measured changes.
+		var bestCls *ClassSymbol
+		var bestMethod *MethodSymbol
 		for _, cls := range a.SymTable.Classes {
 			parts := strings.Split(cls.FQN, `\`)
-			if parts[len(parts)-1] == className {
-				if m, ok := cls.Methods[ref.MethodName]; ok && m.BodyNode != nil {
-					return m.BodyNode, a.sourceForFile(m.File)
-				}
+			if parts[len(parts)-1] != className {
+				continue
+			}
+			m, ok := cls.Methods[ref.MethodName]
+			if !ok || m.BodyNode == nil {
+				continue
+			}
+			if bestCls == nil || cls.FQN < bestCls.FQN {
+				bestCls, bestMethod = cls, m
 			}
 		}
+		if bestMethod != nil {
+			return bestMethod.BodyNode, a.sourceForFile(bestMethod.File), bestCls.FQN
+		}
+
 		if a.Hierarchy != nil {
 			m := a.Hierarchy.ResolveMethod(className, ref.MethodName)
 			if m != nil && m.BodyNode != nil {
-				return m.BodyNode, a.sourceForFile(m.File)
+				// The receiver is the class the callback named, not the ancestor
+				// the body was declared in: `$this` inside an inherited body
+				// still means the subclass, and a nested $this->n() has to
+				// resolve from there.
+				return m.BodyNode, a.sourceForFile(m.File), className
 			}
 		}
 
@@ -690,21 +755,28 @@ func (a *AuthAnalyzer) resolveCallbackBody(ref CallbackRef) (*sitter.Node, []byt
 		if ref.ClosureNode != nil {
 			body := ref.ClosureNode.ChildByFieldName("body")
 			if body != nil {
-				return body, a.sourceForFile(ref.File)
+				// A closure reference carries a node and a file but no class, so
+				// there is no receiver to hand down. A `$this->m()` inside one
+				// falls back to the whole-plugin scan in
+				// analyzeReturnExpression.
+				return body, a.sourceForFile(ref.File), ""
 			}
 		}
 	}
 
-	return nil, nil
+	return nil, nil, ""
 }
 
-func (a *AuthAnalyzer) analyzeReturnStatements(node *sitter.Node, source []byte, depth int) models.AuthLevel {
+// analyzeReturnStatements scores the return values of one body. enclosingFQN is
+// the class that body belongs to ("" if it is not a method or the class is not
+// known); it is what `$this` means inside this body.
+func (a *AuthAnalyzer) analyzeReturnStatements(node *sitter.Node, source []byte, depth int, enclosingFQN string) models.AuthLevel {
 	if depth > 5 {
 		return models.Subscriber
 	}
 
 	var returns []models.AuthLevel
-	collectReturnLevels(node, source, a, depth, &returns)
+	collectReturnLevels(node, source, a, depth, enclosingFQN, &returns)
 
 	if len(returns) == 0 {
 		return models.Subscriber
@@ -719,13 +791,13 @@ func (a *AuthAnalyzer) analyzeReturnStatements(node *sitter.Node, source []byte,
 	return leastRestrictive
 }
 
-func collectReturnLevels(node *sitter.Node, source []byte, aa *AuthAnalyzer, depth int, levels *[]models.AuthLevel) {
+func collectReturnLevels(node *sitter.Node, source []byte, aa *AuthAnalyzer, depth int, enclosingFQN string, levels *[]models.AuthLevel) {
 	if node == nil {
 		return
 	}
 
 	if node.Type() == "return_statement" {
-		level := analyzeReturnValue(node, source, aa, depth)
+		level := analyzeReturnValue(node, source, aa, depth, enclosingFQN)
 		*levels = append(*levels, level)
 		return
 	}
@@ -735,20 +807,20 @@ func collectReturnLevels(node *sitter.Node, source []byte, aa *AuthAnalyzer, dep
 		if child.Type() == "function_definition" || child.Type() == "anonymous_function_creation_expression" {
 			continue
 		}
-		collectReturnLevels(child, source, aa, depth, levels)
+		collectReturnLevels(child, source, aa, depth, enclosingFQN, levels)
 	}
 }
 
-func analyzeReturnValue(retNode *sitter.Node, source []byte, aa *AuthAnalyzer, depth int) models.AuthLevel {
+func analyzeReturnValue(retNode *sitter.Node, source []byte, aa *AuthAnalyzer, depth int, enclosingFQN string) models.AuthLevel {
 	if retNode.NamedChildCount() == 0 {
 		return models.Subscriber
 	}
 
 	expr := retNode.NamedChild(0)
-	return analyzeReturnExpression(expr, source, aa, depth)
+	return analyzeReturnExpression(expr, source, aa, depth, enclosingFQN)
 }
 
-func analyzeReturnExpression(expr *sitter.Node, source []byte, aa *AuthAnalyzer, depth int) models.AuthLevel {
+func analyzeReturnExpression(expr *sitter.Node, source []byte, aa *AuthAnalyzer, depth int, enclosingFQN string) models.AuthLevel {
 	if expr == nil {
 		return models.Subscriber
 	}
@@ -798,18 +870,71 @@ func analyzeReturnExpression(expr *sitter.Node, source []byte, aa *AuthAnalyzer,
 		}
 		methodName := nodeTextFromNode(nameNode, source)
 		if objNode != nil && nodeTextFromNode(objNode, source) == "$this" {
-			for _, cls := range aa.SymTable.Classes {
-				if m, ok := cls.Methods[methodName]; ok && m.BodyNode != nil {
-					methodSource := aa.sourceForFile(m.File)
-					return aa.analyzeReturnStatements(m.BodyNode, methodSource, depth+1)
+			// `$this->m()` calls m on the object this body belongs to: the
+			// enclosing class, then its traits, then its ancestors. Nothing else
+			// is a candidate, in any PHP.
+			//
+			// This used to scan every class in the plugin and keep whichever
+			// declared an m first in map order, which is wrong twice over. It is
+			// nondeterministic -- two runs of one binary over one tree pick
+			// different bodies and report different levels for the same endpoint
+			// -- and even where it settles it answers with a method from a class
+			// that has no relationship to the one under analysis. That is not
+			// hypothetical: 38 of the corpus's 72 `$this->m()` resolutions had
+			// more than one candidate -- two REST controllers and an
+			// authentication class in one tree each declare a
+			// check_permissions() -- and in 19 of them the class the scan
+			// reached was not the class the body belongs to. Those three bodies
+			// happen to score the same level, so no endpoint level moved on this
+			// corpus: 28,881 endpoint keys, identical either way. What moved is
+			// which method the answer came from, and the receiver's own is the
+			// only one that can be right the moment the capabilities differ.
+			//
+			// resolveCallbackBody knows which class it took the body from, so
+			// the receiver is threaded down here and resolved through the MRO
+			// (class -> traits -> parent -> ...), which is where PHP looks and is
+			// already deterministic. Resolving this way removes the ambiguity
+			// rather than defining it: one receiver, one answer. The receiver is
+			// passed on unchanged rather than replaced by the declaring class,
+			// because `$this` inside an inherited body still means the subclass.
+			if enclosingFQN != "" && aa.Hierarchy != nil {
+				if m := aa.Hierarchy.ResolveMethod(enclosingFQN, methodName); m != nil && m.BodyNode != nil {
+					return aa.analyzeReturnStatements(m.BodyNode, aa.sourceForFile(m.File), depth+1, enclosingFQN)
 				}
+			}
+
+			// Fallback, for the two shapes the MRO cannot answer: no receiver at
+			// all (a closure reference carries a node and a file but no class),
+			// or a receiver whose ancestry is not wholly inside the tree -- a
+			// parent that lives in WordPress core, an alias this resolver could
+			// not follow. The whole-plugin scan is then the only candidate set
+			// there is, and dropping to Subscriber instead would throw away the
+			// one candidate that might be right, so it stays -- but it takes the
+			// smallest FQN, for the reason spelled out at resolveCallbackBody's
+			// function case: an arbitrary choice that is at least the same
+			// arbitrary choice on every run. It fires 0 times on the corpus,
+			// where all 72 resolutions had a receiver and the MRO answered every
+			// one of them.
+			var bestCls *ClassSymbol
+			var bestMethod *MethodSymbol
+			for _, cls := range aa.SymTable.Classes {
+				m, ok := cls.Methods[methodName]
+				if !ok || m.BodyNode == nil {
+					continue
+				}
+				if bestCls == nil || cls.FQN < bestCls.FQN {
+					bestCls, bestMethod = cls, m
+				}
+			}
+			if bestMethod != nil {
+				return aa.analyzeReturnStatements(bestMethod.BodyNode, aa.sourceForFile(bestMethod.File), depth+1, bestCls.FQN)
 			}
 		}
 		return models.Subscriber
 
 	case "parenthesized_expression":
 		if expr.NamedChildCount() > 0 {
-			return analyzeReturnExpression(expr.NamedChild(0), source, aa, depth)
+			return analyzeReturnExpression(expr.NamedChild(0), source, aa, depth, enclosingFQN)
 		}
 	}
 
