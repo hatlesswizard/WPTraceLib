@@ -1044,7 +1044,7 @@ func (cg *PluginCallGraph) extractCalls(code string, site callSite) []string {
 			// A WordPress core name is skipped because there is nothing to
 			// recurse into -- unless the plugin declares a function of that
 			// name itself, in which case the call site is the only edge to it.
-			if !phpKeywords[name] && (!wpCoreFunctions[name] || cg.DeclaredNames[name]) {
+			if !cg.skipCallee(name) {
 				add(name)
 			}
 		}
@@ -2213,13 +2213,29 @@ func (cg *PluginCallGraph) walkFrom(key string) []string {
 	return allCalls
 }
 
+// skipCallee reports whether a name ends a walk: PHP's own keywords, and
+// WordPress core names the plugin does not itself declare.
+//
+// It is one method because three places asked this question and one of them
+// answered differently. extractCalls and recurseCalls both carried the
+// DeclaredNames exception -- 730 such declarations across 102 of 143 corpus
+// trees, whose bodies are otherwise unreachable -- and buildCallTree did not,
+// so a plugin's own update_option was a followed edge in FunctionCalls and a
+// childless leaf in -chain-human for the same endpoint. get_option,
+// update_option, add_option and delete_option are all core names a plugin
+// routinely declares a method of its own for.
+//
+// DeclaredNames is read without the lock, as recurseCalls has always read it:
+// the graph is finished before any walk over it starts.
+func (cg *PluginCallGraph) skipCallee(name string) bool {
+	return phpKeywords[name] || (wpCoreFunctions[name] && !cg.DeclaredNames[name])
+}
+
 // recurseCalls recursively follows function calls through the plugin-wide index
 // Memory-optimized: uses pre-computed CallsFrom map instead of re-parsing bodies
 func recurseCalls(cg *PluginCallGraph, funcName string, visited map[string]bool, allCalls *[]string) {
-	// Don't recurse into PHP built-ins, or into WordPress core unless the
-	// plugin declares a function of that name itself -- 730 such declarations
-	// across 102 of 143 corpus trees, whose bodies are otherwise unreachable.
-	if phpKeywords[funcName] || (wpCoreFunctions[funcName] && !cg.DeclaredNames[funcName]) {
+	// A name skipCallee stops at has nothing to recurse into.
+	if cg.skipCallee(funcName) {
 		return
 	}
 
@@ -2369,8 +2385,8 @@ func buildCallTree(cg *PluginCallGraph, funcName string, visited map[string]bool
 		}
 	}
 
-	// Don't recurse into PHP built-ins or WordPress core
-	if phpKeywords[funcName] || wpCoreFunctions[funcName] {
+	// A name skipCallee stops at is still named, it is just not expanded.
+	if cg.skipCallee(funcName) {
 		// Still include the node, just don't recurse
 		return &models.CallChainNode{
 			Function: funcName,
