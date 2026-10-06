@@ -1515,7 +1515,13 @@ func (cg *PluginCallGraph) addHookFamilyCalls(frag string, atStart bool, calls m
 	}
 }
 
-// GetCallees returns all functions called by the given callback, recursively
+// GetCallees returns all functions called by the given callback, recursively.
+//
+// GetRecursiveCallsForCallbackInFile is the better entry point for an endpoint:
+// it resolves the anonymous, widget and file-naming callbacks this one cannot,
+// and it seeds from the declaration in the endpoint's own file as well as from
+// the graph. This remains for a caller that has a plain function name and wants
+// nothing else.
 func (cg *PluginCallGraph) GetCallees(callback string) []string {
 	visited := make(map[string]bool)
 	result := make([]string, 0)
@@ -1527,20 +1533,32 @@ func (cg *PluginCallGraph) GetCallees(callback string) []string {
 
 // getCalleesRecursive is the recursive helper for GetCallees
 func (cg *PluginCallGraph) getCalleesRecursive(funcName string, visited map[string]bool, result *[]string) {
-	if visited[funcName] {
+	if visited[funcName] || cg.skipCallee(funcName) {
 		return
 	}
 	visited[funcName] = true
 
-	cg.mu.RLock()
-	calls, ok := cg.CallsFrom[funcName]
-	cg.mu.RUnlock()
+	// outgoingCalls rather than a raw CallsFrom read: this was the last walk in
+	// the package keying on the declaration's spelling instead of the call
+	// site's, so "$this->save", "->save" and a namespaced name resolved to
+	// nothing and no method inherited from a trait or a parent was followed.
+	calls, aliases := cg.outgoingCalls(funcName)
 
-	if !ok {
-		return
+	// An alias is a function this name may denote, so it belongs in the callee
+	// set in its own right, the way recurseCalls records it.
+	for _, alias := range aliases {
+		if !visited[alias] {
+			visited[alias] = true
+			*result = append(*result, alias)
+		}
 	}
 
 	for _, callee := range calls {
+		// The gate used to sit below this append, so a callee reachable by two
+		// paths was listed twice.
+		if visited[callee] {
+			continue
+		}
 		*result = append(*result, callee)
 		cg.getCalleesRecursive(callee, visited, result)
 	}

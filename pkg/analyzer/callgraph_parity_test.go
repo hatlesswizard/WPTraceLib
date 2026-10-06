@@ -839,3 +839,65 @@ function named_handler() { handler_sink(); }
 
 	mustAgree(t, cg, "named_handler", "boot.php", files["boot.php"], "handler_sink")
 }
+
+// TestGetCalleesNamesEachCalleeOnceAndResolvesMethods covers the last walk in
+// the package that read CallsFrom raw.
+//
+// Two bugs, both visible in six lines. The visited gate sat below the append,
+// so a callee reachable by two paths was listed twice; and keying on the
+// declaration's spelling meant "$this->save" resolved to nothing, so no method
+// reached through a receiver was followed.
+//
+// It has no caller inside this module -- AnalyzeCallback, its only one, has none
+// either -- so this is for library consumers. It is also the precedent that
+// would let the drift back in: after this, no walk in the package reads
+// CallsFrom directly except outgoingCalls, topLevelKeyFor and the file walk.
+func TestGetCalleesNamesEachCalleeOnceAndResolvesMethods(t *testing.T) {
+	diamond := map[string]string{
+		"main.php": `<?php
+function entry() { left(); right(); }
+function left() { shared(); }
+function right() { shared(); }
+function shared() { tail(); }
+function tail() { }
+`,
+	}
+	cg := BuildCallGraph(diamond)
+
+	callees := cg.GetCallees("entry")
+	counts := map[string]int{}
+	for _, c := range callees {
+		counts[c]++
+	}
+	for name, n := range counts {
+		if n > 1 {
+			t.Errorf("%q is listed %d times in %v", name, n, callees)
+		}
+	}
+	for _, want := range []string{"left", "right", "shared", "tail"} {
+		if counts[want] == 0 {
+			t.Errorf("%q missing from %v", want, callees)
+		}
+	}
+
+	receiver := map[string]string{
+		"r.php": `<?php
+class Customer {
+	public function handle() { $this->save(); }
+	public function save() { persisted(); }
+}
+function persisted() { }
+`,
+	}
+	cg = BuildCallGraph(receiver)
+	callees = cg.GetCallees("Customer::handle")
+	found := false
+	for _, c := range callees {
+		if c == "persisted" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a receiver call was not resolved: GetCallees(Customer::handle) = %v", callees)
+	}
+}
