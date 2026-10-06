@@ -530,7 +530,17 @@ func writeCallNode(buf *bytes.Buffer, node *models.CallChainNode, prefix string,
 
 	buf.WriteString(prefix)
 	buf.WriteString(connector)
+	if node.Function == "" {
+		// A sibling list the node budget cut short. Printing nothing here
+		// would let a cut tree read as a complete one.
+		buf.WriteString("... (truncated)\n")
+		return
+	}
 	buf.WriteString(node.Function)
+	if node.Truncated {
+		// Not a leaf: the walk stopped here for want of budget.
+		buf.WriteString(" ...")
+	}
 	buf.WriteString("\n")
 
 	// Prepare prefix for children

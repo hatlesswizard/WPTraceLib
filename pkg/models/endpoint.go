@@ -113,6 +113,12 @@ const (
 type CallChainNode struct {
 	Function string           `json:"function"`
 	Calls    []*CallChainNode `json:"calls,omitempty"`
+	// Truncated says the walk stopped here for want of budget rather than
+	// because there was nothing left to follow. Without it a node cut by the
+	// node or depth cap is indistinguishable from a genuine leaf, so a cut
+	// tree reads as a complete answer. A node with an empty Function is a
+	// sibling list that was cut short.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // Endpoint represents a discovered WordPress endpoint

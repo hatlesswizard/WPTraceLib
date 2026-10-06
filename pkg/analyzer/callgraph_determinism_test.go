@@ -103,6 +103,11 @@ function form_maker_ajax() {
 
 // TestBuildCallTreeAmbiguousUnion verifies that buildCallTree includes calls from
 // ALL implementations of an ambiguous function, not just one random one.
+//
+// The union is no longer built here: outgoingCalls folds every declaration a
+// bare name may denote and merges their edges, and buildCallTree just asks it.
+// The qualified key also appears as a leaf child of the node now, which is the
+// record of WHICH declaration supplied func_b.
 func TestBuildCallTreeAmbiguousUnion(t *testing.T) {
 	files := map[string]string{
 		"/plugin/a.php": `<?php
@@ -332,7 +337,13 @@ function entry() {
 	}
 }
 
-// TestBuildCallTreeCircuitBreaker verifies the maxNodes safety limit stops tree growth.
+// TestBuildCallTreeCircuitBreaker verifies the node budget stops tree growth.
+//
+// Note what this fixture does and does not reach. The root has 200 callees and
+// each has 10, so the budget is divided 200 ways and every branch finishes
+// inside its share: the tree settles at 2,200 nodes and no cap fires. It pins
+// the bound as an upper limit, not the breaker itself -- TestChainTruncationIsReported
+// drives the breaker and asserts that it says so.
 func TestBuildCallTreeCircuitBreaker(t *testing.T) {
 	// Create a wide call graph: root calls 200 functions, each calling 10 more
 	php := "<?php\nfunction root() {\n"
@@ -353,15 +364,27 @@ func TestBuildCallTreeCircuitBreaker(t *testing.T) {
 	tree := GetHierarchicalCallsForCallback(cg, "root", "")
 
 	count := countTreeNodes(tree)
-	// maxNodes is 10000 -- the tree should be capped
-	if count > 10000 {
-		t.Fatalf("Circuit breaker failed: expected at most 10000 nodes, got %d", count)
+	// The budget is per root-level branch, so the ceiling for a root with n
+	// callees is n shares; asserting against the constant keeps this honest if
+	// the constant moves.
+	if ceiling := 200 * maxChainNodes; count > ceiling {
+		t.Fatalf("Circuit breaker failed: expected at most %d nodes, got %d", ceiling, count)
+	}
+	if treeTruncated(tree) {
+		t.Fatalf("this fixture fits inside its budget, so nothing should be truncated; got %d nodes", count)
 	}
 }
 
-// TestDeepCallChainsFullyTraversed verifies that deep linear call chains are
-// fully traversed without artificial depth limits. With permanent visited marking,
-// the tree is naturally bounded by unique functions, not depth.
+// TestDeepCallChainsFullyTraversed verifies that a deep linear call chain is
+// followed to its end.
+//
+// There is a depth limit now, maxChainDepth, and this test sits under it
+// deliberately: 7 levels against a limit of 12. The limit is not there to stop
+// a genuine chain this long, it is there because expansion is depth-first over
+// a graph where one region is reachable by many paths, and an unbounded walk
+// spends its budget re-expanding that region instead of reaching the rest of
+// the plugin. Measured on contact-form-7 6.2, removing the limit dropped
+// coverage from 980 distinct functions to 515.
 func TestDeepCallChainsFullyTraversed(t *testing.T) {
 	files := map[string]string{
 		"/plugin/main.php": `<?php
@@ -378,7 +401,7 @@ function level7() { }
 
 	cg := BuildCallGraph(files)
 
-	// The full chain should be captured (no depth limit, bounded by visited set)
+	// The full chain should be captured: 7 levels is inside maxChainDepth.
 	tree := GetHierarchicalCallsForCallback(cg, "level0", "")
 	if tree == nil {
 		t.Fatal("Expected non-nil tree")

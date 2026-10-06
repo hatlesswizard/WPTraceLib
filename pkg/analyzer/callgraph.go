@@ -2375,193 +2375,197 @@ func BuildPluginCallGraphFromFiles(files map[string]string) *PluginCallGraph {
 	return BuildCallGraph(files)
 }
 
-// GetHierarchicalCallsForCallback returns a hierarchical tree of function calls
-// instead of the flat list returned by GetRecursiveCallsForCallback.
-// This is used when -chain-human or -chain-json flags are specified.
+// A call tree is evidence a person reads, and these are the three bounds on
+// how much of one is built. All three were chosen from a measurement, not
+// guessed: the figures below are one run over contact-form-7 6.2, 89 walked
+// files and 42 endpoints.
+//
+// maxChainNodes is the budget for one root-level branch, not for a whole tree
+// (see chainFrom). It is not what makes the walk terminate -- buildCallTree's
+// path-scoped visited does that -- it is what stops a wide shared DAG from
+// being expanded into something no output can carry. Doubling it to 20,000
+// bought 18 more distinct functions and not one more file, for twice the nodes.
+//
+// maxChainDepth is about fairness rather than termination, and it is the bound
+// that mattered most. Expansion is depth-first over a graph where the same
+// region is reachable by many paths, so a deep branch re-expands that region
+// once per path and spends the budget on repetition. Raising the limit to 20
+// dropped coverage from 980 distinct functions to 647, and removing it
+// altogether dropped it to 515 while the same run reached depth 39: deeper
+// bought strictly less. 12 is above the deepest chain this package's tests pin
+// (7) and above auth.go's own recursion limit of 5.
+//
+// minBranchNodes is the floor under a branch's share once the budget is divided
+// among a callback's root-level callees. A dispatch table registering two
+// hundred actions against one method would otherwise leave each branch 50
+// nodes; below that a branch cannot show even a shallow chain, so the floor
+// wins over the division and the total is allowed to exceed maxChainNodes.
+const (
+	maxChainNodes  = 10000
+	maxChainDepth  = 12
+	minBranchNodes = 50
+)
+
+// truncatedNode records that a sibling list was cut short. A node with no
+// Function is the only shape that cannot be mistaken for a real callee.
+func truncatedNode() *models.CallChainNode {
+	return &models.CallChainNode{Truncated: true}
+}
+
+// GetHierarchicalCallsForCallback is GetRecursiveCallsForCallback's answer as a
+// tree instead of a flat list. It is what -chain-human and -chain-json print.
+//
+// The two must name the same functions, and for two releases they did not.
+// This walk kept its own copy of the callback resolution and its own raw reads
+// of CallsFrom, and so it never learned any of the six things the flat walk
+// learned after they split: that a callback's body and the graph are
+// complementary seeds rather than alternatives, that outgoingCalls is how a
+// call-site spelling is matched to a declaration, that a name the plugin
+// declares itself is followed even when WordPress has one too, and that an
+// anonymous callback, a widget callback and a file callback each resolve to
+// something. Both walks now start from callbackStart and expand through
+// outgoingCalls, and TestFlatAndHierarchicalNameTheSameFunctions fails if one
+// is taught something the other is not.
 func GetHierarchicalCallsForCallback(cg *PluginCallGraph, callback, fileContent string) []*models.CallChainNode {
-	if callback == "" || callback == "unknown" || callback == "inline" || callback == "closure" {
+	return GetHierarchicalCallsForCallbackInFile(cg, callback, "", fileContent)
+}
+
+// GetHierarchicalCallsForCallbackInFile is GetHierarchicalCallsForCallback told
+// which file the endpoint was found in, for the reason
+// GetRecursiveCallsForCallbackInFile is: a `direct` endpoint's callback names a
+// .php file rather than a function, and 164 of the 618 such files in the corpus
+// share a basename with another file in the same tree, so only the path
+// disambiguates which bootstrap to walk.
+func GetHierarchicalCallsForCallbackInFile(cg *PluginCallGraph, callback, endpointFile, fileContent string) []*models.CallChainNode {
+	s := cg.callbackStart(callback, endpointFile, fileContent)
+	if s.Declined() {
+		return nil
+	}
+	return cg.chainFrom(s)
+}
+
+// chainFrom builds the forest for one already-resolved callback.
+//
+// Aliases are emitted as leaves, first, because an alias is another spelling of
+// the thing it hangs off rather than something that thing calls -- and because
+// outgoingCalls has already folded each alias's own edges into the call list,
+// so expanding them as well would print the same subtree twice under two names.
+// This is exactly what recurseCalls does with an alias, which is what makes the
+// parity between the two walks an invariant rather than a coincidence.
+func (cg *PluginCallGraph) chainFrom(s callbackStart) []*models.CallChainNode {
+	calls := s.Expandable()
+	if len(calls) == 0 && len(s.Aliases) == 0 {
 		return nil
 	}
 
-	// Clean up the callback name
-	callback = ResolveCallback(callback, "")
-
-	// Skip if callback looks like a variable or expression
-	if strings.HasPrefix(callback, "$") || strings.Contains(callback, "(") {
-		return nil
+	visited := make(map[string]bool, 16)
+	if s.FileKey {
+		// walkFrom has always marked a file's own node before expanding it, so
+		// a circular include cannot list the file as its own callee. The two
+		// walks have to agree about that as well.
+		visited[s.Node] = true
 	}
 
-	// Track visited functions to prevent infinite recursion
-	// Using a map per recursive path to allow same function in different branches
-	visited := make(map[string]bool)
+	// The callback itself is NOT pre-marked. That mark used to be set and never
+	// deleted, so a handler something calls back into could not appear anywhere
+	// inside its own tree while the flat list named it. buildCallTree's
+	// path-scoped visited already cuts a self-call one level in, so dropping the
+	// mark terminates just as surely and makes the two walks agree exactly.
+	nodes := make([]*models.CallChainNode, 0, len(s.Aliases)+len(calls))
+	for _, alias := range s.Aliases {
+		nodes = append(nodes, &models.CallChainNode{Function: alias})
+	}
 
-	// First, try to find the callback body in the current file
-	body := lookupFunctionBody(fileContent, callback)
-
-	var immediateCalls []string
-	if body != "" {
-		// Extract calls from the function body
-		immediateCalls = ExtractFunctionCalls(body)
-	} else {
-		// Try to find in the plugin-wide index
-		cg.mu.RLock()
-		calls, found := cg.CallsFrom[callback]
-		ambiguousKeys := cg.AmbiguousFuncs[callback]
-		if !found {
-			// Try without class prefix
-			methodOnly := callback
-			if idx := strings.LastIndex(callback, "::"); idx >= 0 {
-				methodOnly = callback[idx+2:]
-			}
-			calls, found = cg.CallsFrom[methodOnly]
-			if found {
-				ambiguousKeys = cg.AmbiguousFuncs[methodOnly]
-			}
+	// Each root-level callee gets its own share of the budget rather than all
+	// of them drawing on one counter.
+	//
+	// Expansion is depth-first, so with a single counter the first callee spends
+	// whatever it likes and the rest are dropped. That is not a corner: on
+	// contact-form-7 6.2 one shared counter spent 240,744 nodes to name 989
+	// distinct functions, a 243-fold redundancy, because a deep shared region
+	// was re-expanded under every path that reached it. Dividing the budget
+	// bounds each branch instead of letting one of them starve the others, and
+	// the same run then names more of the plugin in fewer nodes.
+	share := maxChainNodes
+	if n := len(calls); n > 1 {
+		share = maxChainNodes / n
+		if share < minBranchNodes {
+			share = minBranchNodes
 		}
-		cg.mu.RUnlock()
-
-		if found {
-			immediateCalls = calls
-			// DETERMINISM: If the root callback is ambiguous, merge all implementations
-			if len(ambiguousKeys) > 0 {
-				allCalls := make(map[string]bool, len(calls))
-				for _, c := range calls {
-					allCalls[c] = true
-				}
-				cg.mu.RLock()
-				for _, qualifiedKey := range ambiguousKeys {
-					if extraCalls, ok := cg.CallsFrom[qualifiedKey]; ok {
-						for _, c := range extraCalls {
-							allCalls[c] = true
-						}
-					}
-				}
-				cg.mu.RUnlock()
-				immediateCalls = make([]string, 0, len(allCalls))
-				for c := range allCalls {
-					immediateCalls = append(immediateCalls, c)
-				}
-				sort.Strings(immediateCalls)
-			}
-		}
 	}
 
-	if len(immediateCalls) == 0 {
-		return nil
-	}
-
-	// Build hierarchical tree from immediate calls
-	visited[callback] = true
-	result := make([]*models.CallChainNode, 0, len(immediateCalls))
-	nodeCount := 0
-	const maxNodes = 10000 // Safety limit to prevent unbounded tree growth
-
-	for _, call := range immediateCalls {
+	total := 0
+	for _, call := range calls {
 		if visited[call] {
 			continue
 		}
-		if nodeCount >= maxNodes {
+		if total >= maxChainNodes {
+			// A root-level callee dropped for want of budget is the most
+			// valuable row in the output, so the drop is recorded rather than
+			// the list simply ending as though nothing followed.
+			nodes = append(nodes, truncatedNode())
 			break
 		}
-		node := buildCallTree(cg, call, visited, &nodeCount, maxNodes)
-		if node != nil {
-			result = append(result, node)
+		branch := 0
+		if node := buildCallTree(cg, call, visited, &branch, share, 1); node != nil {
+			nodes = append(nodes, node)
 		}
+		total += branch
 	}
-
-	return result
+	return nodes
 }
 
-// buildCallTree recursively builds the call tree for a function
-func buildCallTree(cg *PluginCallGraph, funcName string, visited map[string]bool, nodeCount *int, maxNodes int) *models.CallChainNode {
+// buildCallTree recursively builds the call tree for a function.
+func buildCallTree(cg *PluginCallGraph, funcName string, visited map[string]bool, nodeCount *int, maxNodes, depth int) *models.CallChainNode {
 	*nodeCount++
 
-	// Circuit breaker: stop expanding if node limit reached
-	if *nodeCount >= maxNodes {
-		return &models.CallChainNode{
-			Function: funcName,
-			Calls:    nil,
-		}
+	// Circuit breaker, and it says that it fired. A node returned here with no
+	// children used to be indistinguishable from a genuine leaf, so a tree cut
+	// at the cap read as a complete answer to "what does this endpoint reach".
+	if *nodeCount >= maxNodes || depth >= maxChainDepth {
+		return &models.CallChainNode{Function: funcName, Truncated: true}
 	}
 
 	// A name skipCallee stops at is still named, it is just not expanded.
 	if cg.skipCallee(funcName) {
-		// Still include the node, just don't recurse
-		return &models.CallChainNode{
-			Function: funcName,
-			Calls:    nil,
-		}
+		return &models.CallChainNode{Function: funcName}
 	}
 
-	// Create the node
-	node := &models.CallChainNode{
-		Function: funcName,
-		Calls:    nil,
-	}
+	node := &models.CallChainNode{Function: funcName}
 
 	// Mark as visited on THIS PATH only (ancestor tracking for cycle detection).
 	// After processing all children, we remove it so sibling branches can
-	// independently expand this function. The maxNodes cap bounds total growth.
+	// independently expand this function. The branch budget bounds total
+	// growth.
 	visited[funcName] = true
 	defer delete(visited, funcName)
 
-	// Look up the pre-computed calls for this function
-	cg.mu.RLock()
-	calls, found := cg.CallsFrom[funcName]
-	ambiguousKeys := cg.AmbiguousFuncs[funcName]
-	if !found {
-		// Try without class prefix
-		methodOnly := funcName
-		if idx := strings.LastIndex(funcName, "::"); idx >= 0 {
-			methodOnly = funcName[idx+2:]
-		}
-		calls, found = cg.CallsFrom[methodOnly]
-		if found {
-			ambiguousKeys = cg.AmbiguousFuncs[methodOnly]
-		}
-	}
-	cg.mu.RUnlock()
-
-	if !found || len(calls) == 0 {
+	// Callees come from outgoingCalls, the resolver the flat walk and the file
+	// walk already share. Reading CallsFrom directly with a "::"-stripping
+	// fallback -- which is what this walk did -- cannot match the tokens
+	// extractCalls deliberately emits: "$this->save", "->save" and a namespaced
+	// name match no CallsFrom key, so every such call was a childless leaf, and
+	// no method inherited from a trait or a parent was ever followed.
+	calls, aliases := cg.outgoingCalls(funcName)
+	if len(calls) == 0 && len(aliases) == 0 {
+		// External function (WordPress core, PHP built-in, or not found in plugin)
 		return node
 	}
 
-	// DETERMINISM: If this function name is ambiguous (multiple standalone
-	// implementations across different files), include calls from ALL
-	// implementations to ensure complete coverage. This way the output
-	// always includes all reachable code paths regardless of file ordering.
-	if len(ambiguousKeys) > 0 {
-		allCalls := make(map[string]bool, len(calls))
-		for _, c := range calls {
-			allCalls[c] = true
-		}
-		cg.mu.RLock()
-		for _, qualifiedKey := range ambiguousKeys {
-			if extraCalls, ok := cg.CallsFrom[qualifiedKey]; ok {
-				for _, c := range extraCalls {
-					allCalls[c] = true
-				}
-			}
-		}
-		cg.mu.RUnlock()
-		// Rebuild calls as a sorted slice for deterministic order
-		calls = make([]string, 0, len(allCalls))
-		for c := range allCalls {
-			calls = append(calls, c)
-		}
-		sort.Strings(calls)
+	node.Calls = make([]*models.CallChainNode, 0, len(aliases)+len(calls))
+	for _, alias := range aliases {
+		node.Calls = append(node.Calls, &models.CallChainNode{Function: alias})
+		*nodeCount++
 	}
-
-	// Build child nodes
-	node.Calls = make([]*models.CallChainNode, 0, len(calls))
 	for _, call := range calls {
 		if visited[call] {
-			continue // Skip cycles
+			continue // an ancestor on this path: a cycle
 		}
 		if *nodeCount >= maxNodes {
+			node.Calls = append(node.Calls, truncatedNode())
 			break
 		}
-		childNode := buildCallTree(cg, call, visited, nodeCount, maxNodes)
+		childNode := buildCallTree(cg, call, visited, nodeCount, maxNodes, depth+1)
 		if childNode != nil {
 			node.Calls = append(node.Calls, childNode)
 		}
