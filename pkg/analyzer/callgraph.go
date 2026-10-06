@@ -2050,11 +2050,20 @@ func EnrichEndpointsWithPluginCallGraph(endpoints []models.Endpoint, callGraph *
 // WordPress registration function; from there the walk proceeds through the
 // graph exactly as it does for a named callback.
 func (cg *PluginCallGraph) closureSeededCalls(fileContent string) []string {
-	seeds := cg.registrationClosureCalls(fileContent)
+	return cg.seededWalk(cg.registrationClosureCalls(fileContent))
+}
+
+// seededWalk expands a seed set into its transitive callee list.
+//
+// It is the loop the callee walk has always run once a callback resolved to
+// something, split out so that a seed which did not come from a named
+// declaration -- a registration closure's calls, a file's load-time edges --
+// is expanded by the same code as one that did.
+func (cg *PluginCallGraph) seededWalk(seeds []string) []string {
 	if len(seeds) == 0 {
 		return nil
 	}
-	visited := make(map[string]bool)
+	visited := make(map[string]bool, len(seeds))
 	allCalls := make([]string, 0, len(seeds))
 	for _, call := range seeds {
 		if visited[call] {
@@ -2085,13 +2094,147 @@ func GetRecursiveCallsForCallback(cg *PluginCallGraph, callback, fileContent str
 // the 618 direct-endpoint files in the corpus share a basename with another
 // file in the same tree and a basename lookup would walk the wrong bootstrap.
 func GetRecursiveCallsForCallbackInFile(cg *PluginCallGraph, callback, endpointFile, fileContent string) []string {
+	s := cg.callbackStart(callback, endpointFile, fileContent)
+	switch {
+	case s.Anonymous:
+		return cg.seededWalk(s.Calls)
+	case s.FileKey:
+		return cg.walkFrom(s.Node)
+	case s.Declined():
+		return nil
+	}
+
+	// Track visited functions to prevent infinite recursion
+	visited := make(map[string]bool)
+	allCalls := make([]string, 0)
+
+	// The two branches differ only in whether an alias is recursed into, and
+	// that difference is the shape this walk's published FunctionCalls order
+	// has always had. Union collapses duplicates at their first occurrence,
+	// which the visited gate below already did at the same positions, so the
+	// list this returns is unchanged by routing through it.
+	if s.Declared {
+		for _, call := range s.Union() {
+			if !visited[call] {
+				visited[call] = true
+				allCalls = append(allCalls, call)
+				// Recursively follow this call using the pre-computed call graph
+				recurseCalls(cg, call, visited, &allCalls)
+			}
+		}
+	} else {
+		for _, alias := range s.Aliases {
+			if !visited[alias] {
+				visited[alias] = true
+				allCalls = append(allCalls, alias)
+			}
+		}
+		for _, call := range s.Calls {
+			if !visited[call] {
+				visited[call] = true
+				allCalls = append(allCalls, call)
+				// Recursively follow this call
+				recurseCalls(cg, call, visited, &allCalls)
+			}
+		}
+	}
+
+	return allCalls
+}
+
+// callbackStart is where a walk from one endpoint's callback begins: the node a
+// path out of it starts at, and the seed groups that walk expands.
+//
+// Resolving a callback is six decisions deep -- the four anonymous sentinels,
+// ResolveCallback, the trailing empty argument list, the file-naming callback,
+// the "looks like an expression" guard, and the declaration in the endpoint's
+// own file -- and a second copy of them is a second set of answers. The
+// hierarchical walk had a second copy and it got five of the six wrong, so
+// CallChain and FunctionCalls disagreed about what the same endpoint reaches.
+type callbackStart struct {
+	// Node is the call-graph key the callback resolved to, or the sentinel it
+	// arrived as when it is anonymous, or "" when it is an expression this
+	// package declines to resolve.
+	Node string
+	// Anonymous marks a callback with no name to look up. Calls is then seeded
+	// from the registration closures in the endpoint's own file.
+	Anonymous bool
+	// FileKey marks a callback that named a .php file. Calls is then that
+	// file's load-time edges.
+	FileKey bool
+	// Declared marks a callback whose declaration was FOUND in fileContent.
+	// This is not len(Body) > 0: a declaration with no calls in it is found and
+	// contributes nothing, and a walk treats that like a found body rather than
+	// like a missing one.
+	Declared bool
+	// Body are the tokens read out of that declaration. They are not graph
+	// edges. ExtractFunctionCalls is a package-level function with no call
+	// graph, so it cannot resolve do_action of a hook name to the callbacks
+	// registered for that hook -- cg.extractCalls does that, and its result
+	// lives in CallsFrom. It also keeps WordPress core names, which
+	// extractCalls drops.
+	Body []string
+	// Aliases are the qualified keys the callback's own name may denote.
+	Aliases []string
+	// Calls are the graph's edges out of the callback.
+	Calls []string
+}
+
+// Declined reports that the callback is an expression this package does not
+// resolve: a variable, or a call written with arguments.
+func (s callbackStart) Declined() bool {
+	return s.Node == "" && !s.Anonymous && !s.FileKey
+}
+
+// Union is the seed in the order the flat walk has always emitted it: the
+// declaration's own calls, then the graph's aliases, then the graph's calls,
+// each name kept at its first occurrence.
+//
+// Neither source alone is enough. Taking only the body meant that for every
+// endpoint whose callback is declared in the file that registered it, which is
+// the ordinary case, every hook edge was discarded. WordPress control flow runs
+// through hooks, so that disconnected a large part of each plugin from its own
+// entry points. Taking only the graph loses what this particular declaration
+// does. The two are complementary rather than alternative, so both are used.
+func (s callbackStart) Union() []string {
+	return dedupKeepFirst(len(s.Body)+len(s.Aliases)+len(s.Calls), s.Body, s.Aliases, s.Calls)
+}
+
+// Expandable is the seed's call edges -- everything but the aliases. The tree
+// walk expands these and hangs the aliases off the root as leaves, because an
+// alias is another spelling of the root rather than a call the root makes.
+func (s callbackStart) Expandable() []string {
+	return dedupKeepFirst(len(s.Body)+len(s.Calls), s.Body, s.Calls)
+}
+
+// dedupKeepFirst concatenates groups, keeping each name at its first occurrence.
+func dedupKeepFirst(size int, groups ...[]string) []string {
+	out := make([]string, 0, size)
+	seen := make(map[string]bool, size)
+	for _, g := range groups {
+		for _, name := range g {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func (cg *PluginCallGraph) callbackStart(callback, endpointFile, fileContent string) callbackStart {
 	if callback == "" || callback == "unknown" || callback == "inline" || callback == "closure" {
 		// An anonymous callback has no name to look up, but it does have a
 		// body, and that body is in the file this endpoint was found in.
-		// Returning nil here meant that every route registered with an inline
-		// function reached nothing at all -- the endpoint was reported and
-		// everything behind it was invisible.
-		return cg.closureSeededCalls(fileContent)
+		// Resolving to nothing here meant that every route registered with an
+		// inline function reached nothing at all -- the endpoint was reported
+		// and everything behind it was invisible.
+		return callbackStart{
+			Node:      callback,
+			Anonymous: true,
+			Calls:     cg.registrationClosureCalls(fileContent),
+		}
 	}
 
 	// Clean up the callback name
@@ -2105,68 +2248,24 @@ func GetRecursiveCallsForCallbackInFile(cg *PluginCallGraph, callback, endpointF
 
 	// A callback that names a FILE is the file's load-time code.
 	if key := cg.topLevelKeyFor(callback, endpointFile); key != "" {
-		return cg.walkFrom(key)
+		calls, aliases := cg.outgoingCalls(key)
+		return callbackStart{Node: key, FileKey: true, Calls: calls, Aliases: aliases}
 	}
 
 	// Skip if callback looks like a variable or expression
 	if strings.HasPrefix(callback, "$") || strings.Contains(callback, "(") {
-		return nil
+		return callbackStart{}
 	}
 
-	// Track visited functions to prevent infinite recursion
-	visited := make(map[string]bool)
-	allCalls := make([]string, 0)
-
-	// First, try to find the callback body in the current file (for local methods like $this->method)
-	body := lookupFunctionBody(fileContent, callback)
-
-	// If we found the body in the current file, extract its immediate calls.
-	//
-	// The body alone is not enough. ExtractFunctionCalls is a package-level
-	// function with no call graph, so it cannot resolve do_action('x') to the
-	// callbacks registered for x -- cg.extractCalls does that, and its result
-	// lives in CallsFrom. Taking only the body meant that for every endpoint
-	// whose callback is declared in the file that registered it, which is the
-	// ordinary case, every hook edge was discarded. WordPress control flow runs
-	// through hooks, so that disconnected a large part of each plugin from its
-	// own entry points.
-	//
-	// The two sources are complementary rather than alternative, so both are
-	// used: the body is precise about this declaration, and the graph knows
-	// about hooks and about names spelled differently at the call site.
-	if body != "" {
-		immediateCalls := ExtractFunctionCalls(body)
-		graphCalls, graphAliases := cg.outgoingCalls(callback)
-		immediateCalls = append(immediateCalls, graphAliases...)
-		immediateCalls = append(immediateCalls, graphCalls...)
-		for _, call := range immediateCalls {
-			if !visited[call] {
-				visited[call] = true
-				allCalls = append(allCalls, call)
-				// Recursively follow this call using the pre-computed call graph
-				recurseCalls(cg, call, visited, &allCalls)
-			}
-		}
-	} else {
-		// Try to find in the plugin-wide index using pre-computed calls.
-		calls, aliases := cg.outgoingCalls(callback)
-		for _, alias := range aliases {
-			if !visited[alias] {
-				visited[alias] = true
-				allCalls = append(allCalls, alias)
-			}
-		}
-		for _, call := range calls {
-			if !visited[call] {
-				visited[call] = true
-				allCalls = append(allCalls, call)
-				// Recursively follow this call
-				recurseCalls(cg, call, visited, &allCalls)
-			}
-		}
+	s := callbackStart{Node: callback}
+	// Look for the callback body in the endpoint's own file first, the way a
+	// local method like $this->handle is only visible there.
+	if body := lookupFunctionBody(fileContent, callback); body != "" {
+		s.Declared = true
+		s.Body = ExtractFunctionCalls(body)
 	}
-
-	return allCalls
+	s.Calls, s.Aliases = cg.outgoingCalls(callback)
+	return s
 }
 
 // topLevelKeyFor resolves a callback that names a file to that file's
