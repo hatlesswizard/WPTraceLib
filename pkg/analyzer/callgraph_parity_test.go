@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -688,4 +689,153 @@ function fam_two_cb() { }
 	if wantCalls == "" {
 		t.Fatal("fixture produced no edges out of K::go")
 	}
+}
+
+// TestEnrichmentIsKeyedOnCallbackAndFile covers the memoisation key.
+//
+// A tree depends on the callback AND on the file its body is looked up in,
+// because callbackStart reads the declaration out of that file and seeds the
+// root with what it finds there. The hierarchical enricher keyed on the callback
+// alone, so the first endpoint's tree was served to every later endpoint
+// sharing the name -- and endpoints share callbacks constantly.
+//
+// The two endpoints below differ only in their file. The one whose file declares
+// handle must name get_option, which can only come from the body:
+// ExtractFunctionCalls keeps WordPress core names and extractCalls drops them,
+// so get_option is in no CallsFrom entry. The other must not name it. Under a
+// callback-only key one of those two assertions fails whichever endpoint is
+// computed first, so the test does not depend on endpoint order.
+func TestEnrichmentIsKeyedOnCallbackAndFile(t *testing.T) {
+	const pluginDir = "/plugin"
+	rel := map[string]string{
+		"one/a.php": `<?php
+add_action( 'wp_ajax_alpha', 'handle' );
+function handle() { get_option( 'k' ); alpha_sink(); }
+`,
+		"two/b.php": `<?php
+add_action( 'wp_ajax_beta', 'handle' );
+`,
+	}
+
+	files := make(map[string]string, len(rel))
+	for name, src := range rel {
+		files[filepath.Join(pluginDir, name)] = src
+	}
+	cg := BuildCallGraph(files)
+
+	endpoints := []models.Endpoint{
+		{Type: models.EndpointTypeAJAX, Route: "alpha", Callback: "handle", File: "one/a.php"},
+		{Type: models.EndpointTypeAJAX, Route: "beta", Callback: "handle", File: "two/b.php"},
+	}
+
+	a := New(WithWorkers(1), WithChainMode(ChainModeHierarchical))
+	a.enrichEndpointsWithHierarchicalCallGraph(endpoints, cg, files, pluginDir)
+
+	alpha := treeNames(endpoints[0].CallChain)
+	beta := treeNames(endpoints[1].CallChain)
+
+	if !alpha["get_option"] {
+		t.Errorf("the endpoint whose own file declares handle should name get_option from the body; got %v", sortedNames(alpha))
+	}
+	if beta["get_option"] {
+		t.Errorf("the endpoint whose file does not declare handle reused the other's tree; got %v", sortedNames(beta))
+	}
+	// Both still reach what the graph knows.
+	for i, names := range []map[string]bool{alpha, beta} {
+		if !names["alpha_sink"] {
+			t.Errorf("endpoint %d lost the graph edge to alpha_sink; got %v", i, sortedNames(names))
+		}
+	}
+}
+
+// TestEnrichmentPassesTheEndpointFile covers a callback that names a .php file.
+//
+// Both enrichers had already computed the endpoint's full path and then called
+// the three-argument form, which passes "" for it. topLevelKeyFor therefore
+// never got its path candidate in production and fell back to the
+// unique-basename rule, so a direct endpoint sharing a basename with another
+// file in the tree resolved to nothing -- 164 of the corpus's 618 such files.
+func TestEnrichmentPassesTheEndpointFile(t *testing.T) {
+	const pluginDir = "/plugin"
+	rel := map[string]string{
+		"one/handler.php": `<?php one_sink();`,
+		"two/handler.php": `<?php two_sink();`,
+	}
+	files := make(map[string]string, len(rel))
+	for name, src := range rel {
+		files[filepath.Join(pluginDir, name)] = src
+	}
+	cg := BuildCallGraph(files)
+
+	newEndpoints := func() []models.Endpoint {
+		return []models.Endpoint{
+			{Type: models.EndpointTypeDirect, Route: "/two/handler.php", Callback: "handler.php", File: "two/handler.php"},
+		}
+	}
+
+	a := New(WithWorkers(1), WithChainMode(ChainModeHierarchical))
+	hier := newEndpoints()
+	a.enrichEndpointsWithHierarchicalCallGraph(hier, cg, files, pluginDir)
+	names := treeNames(hier[0].CallChain)
+	if !names["two_sink"] {
+		t.Errorf("tree: the endpoint's own file did not resolve; got %v", sortedNames(names))
+	}
+	if names["one_sink"] {
+		t.Errorf("tree: the wrong bootstrap was walked; got %v", sortedNames(names))
+	}
+
+	flat := newEndpoints()
+	a.enrichEndpointsRecursively(flat, cg, files, pluginDir)
+	flatSet := make(map[string]bool, len(flat[0].FunctionCalls))
+	for _, c := range flat[0].FunctionCalls {
+		flatSet[c] = true
+	}
+	if !flatSet["two_sink"] {
+		t.Errorf("flat: the endpoint's own file did not resolve; got %v", flat[0].FunctionCalls)
+	}
+	if flatSet["one_sink"] {
+		t.Errorf("flat: the wrong bootstrap was walked; got %v", flat[0].FunctionCalls)
+	}
+}
+
+// TestEndpointFileDoesNotHijackANamedCallback pins the guard on topLevelKeyFor.
+//
+// topLevelKeyFor tries the endpoint's own path before the callback, so that a
+// direct endpoint whose basename is ambiguous resolves to its own file. But the
+// path is a disambiguator for a file-naming callback, not a substitute for one:
+// without a check that the callback looks like a file at all, every callback
+// found in a file that has load-time code resolves to that file's load-time
+// node instead of to the function named.
+//
+// This was invisible while the only production caller passed "" for
+// endpointFile. The first run that passed a real path took contact-form-7 from
+// 991 distinct functions across its chains to 309, and lost the very chain this
+// release exists to restore.
+func TestEndpointFileDoesNotHijackANamedCallback(t *testing.T) {
+	files := map[string]string{
+		"boot.php": `<?php
+// Load-time code, so this file has a top-level node of its own.
+bootstrap_sink();
+add_action( 'wp_ajax_go', 'named_handler' );
+function named_handler() { handler_sink(); }
+`,
+	}
+	cg := BuildCallGraph(files)
+
+	if key := cg.topLevelKeyFor("named_handler", "boot.php"); key != "" {
+		t.Errorf("a callback that is not file-shaped resolved to the file node %q", key)
+	}
+	if key := cg.topLevelKeyFor("boot.php", "boot.php"); key == "" {
+		t.Error("a callback that names a file should still resolve to that file's node")
+	}
+
+	names := treeNames(GetHierarchicalCallsForCallbackInFile(cg, "named_handler", "boot.php", files["boot.php"]))
+	if !names["handler_sink"] {
+		t.Errorf("the named callback was not expanded; got %v", sortedNames(names))
+	}
+	if names["bootstrap_sink"] {
+		t.Errorf("the callback was resolved to its file's load-time code; got %v", sortedNames(names))
+	}
+
+	mustAgree(t, cg, "named_handler", "boot.php", files["boot.php"], "handler_sink")
 }

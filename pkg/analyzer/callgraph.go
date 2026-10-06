@@ -2275,7 +2275,24 @@ func (cg *PluginCallGraph) callbackStart(callback, endpointFile, fileContent str
 // basename is accepted only when exactly one file in the tree carries it --
 // the same rule resolveIncludePath already applies -- so an ambiguous name
 // resolves to nothing rather than to an arbitrary other file's bootstrap.
+//
+// The callback has to look like a file before the endpoint's path is consulted.
+// The path is a disambiguator for a file-naming callback, not a substitute for
+// one, and preferring it unconditionally resolves EVERY callback found in a
+// file that has load-time code to that file's node instead of to the function
+// named. That cost nothing while the only caller passed "" for endpointFile;
+// the first run that passed a real path took contact-form-7 from 980 distinct
+// functions in its chains to 309 and lost the chain this release exists to
+// restore.
+//
+// A direct endpoint's callback arrives as "file:<relpath>" (see direct.go), and
+// that spelling still ends in .php, so it passes here and resolves through the
+// endpoint's own path.
 func (cg *PluginCallGraph) topLevelKeyFor(callback, endpointFile string) string {
+	if !strings.HasSuffix(strings.ToLower(callback), ".php") {
+		return ""
+	}
+
 	cg.mu.RLock()
 	defer cg.mu.RUnlock()
 

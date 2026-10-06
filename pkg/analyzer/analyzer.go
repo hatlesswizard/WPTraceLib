@@ -823,8 +823,9 @@ func (a *Analyzer) readFileContent(filepath string) (string, error) {
 
 // enrichEndpointsRecursively enriches all endpoints with recursive call graph analysis (flat list)
 func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callGraph *PluginCallGraph, fileContents map[string]string, pluginDir string) {
-	// Memoise on (callback, file), the way the hierarchical variant below has
-	// always memoised on the callback.
+	// Memoise on (callback, file). The hierarchical variant below memoised on
+	// the callback alone, which was a bug and not a precedent: it served the
+	// first endpoint's answer to every later endpoint sharing the name.
 	//
 	// Without it this runs one full recursive walk per endpoint, and endpoints
 	// share callbacks constantly -- several routes on one handler, a widget's
@@ -866,8 +867,12 @@ func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callG
 			content = StripPHPComments(content)
 		}
 
-		// Get recursive calls using the plugin-wide call graph
-		calls := GetRecursiveCallsForCallback(callGraph, endpoints[i].Callback, content)
+		// Get recursive calls using the plugin-wide call graph. The endpoint's
+		// own file is what disambiguates a callback that names a .php file, and
+		// this caller used to drop it, so topLevelKeyFor fell back to the
+		// unique-basename rule and 164 of the corpus's 618 direct-endpoint
+		// files could not resolve at all.
+		calls := GetRecursiveCallsForCallbackInFile(callGraph, endpoints[i].Callback, fullPath, content)
 		memo[callKey{endpoints[i].Callback, fullPath}] = calls
 		if len(calls) > 0 {
 			endpoints[i].FunctionCalls = calls
@@ -878,41 +883,48 @@ func (a *Analyzer) enrichEndpointsRecursively(endpoints []models.Endpoint, callG
 // enrichEndpointsWithHierarchicalCallGraph enriches endpoints with hierarchical call trees
 // This is used when -chain-human or -chain-json flags are specified
 func (a *Analyzer) enrichEndpointsWithHierarchicalCallGraph(endpoints []models.Endpoint, callGraph *PluginCallGraph, fileContents map[string]string, pluginDir string) {
-	// Memoization cache: avoid rebuilding identical trees for endpoints sharing the same callback
-	chainCache := make(map[string][]*models.CallChainNode)
+	// Memoise on (callback, file), exactly as enrichEndpointsRecursively does
+	// and for the same reason: a tree depends on the callback AND on the file
+	// its body is looked up in, because callbackStart reads the declaration out
+	// of that file and seeds the root with what it finds. Keying on the callback
+	// alone served the first endpoint's tree to every later endpoint sharing the
+	// name, and endpoints share callbacks constantly -- one handler on several
+	// routes, a widget's render and admin faces, a dispatch table registering
+	// twenty actions against one method.
+	type chainKey struct{ callback, file string }
+	chainCache := make(map[chainKey][]*models.CallChainNode)
 
 	for i := range endpoints {
 		if endpoints[i].Callback == "" {
 			continue
 		}
 
-		// Check memoization cache first
-		cacheKey := endpoints[i].Callback
-		if cached, ok := chainCache[cacheKey]; ok {
+		// The path is half the key, so it is computed before the lookup.
+		fullPath := filepath.Join(pluginDir, endpoints[i].File)
+		key := chainKey{endpoints[i].Callback, fullPath}
+		if cached, ok := chainCache[key]; ok {
 			if len(cached) > 0 {
 				endpoints[i].CallChain = cached
 			}
 			continue
 		}
 
-		// Get the file content for this endpoint
-		fullPath := filepath.Join(pluginDir, endpoints[i].File)
 		content, ok := fileContents[fullPath]
 		if !ok {
 			// Try to read the file
 			var err error
 			content, err = a.readFileContent(fullPath)
 			if err != nil {
-				chainCache[cacheKey] = nil
+				chainCache[key] = nil
 				continue
 			}
 			content = StripPHPComments(content)
 		}
 
 		// Get hierarchical call chain using the plugin-wide call graph.
-		// Per-path visited + maxNodes cap in buildCallTree bounds tree size.
-		chain := GetHierarchicalCallsForCallback(callGraph, endpoints[i].Callback, content)
-		chainCache[cacheKey] = chain
+		// Per-path visited + the per-branch budget bound tree size.
+		chain := GetHierarchicalCallsForCallbackInFile(callGraph, endpoints[i].Callback, fullPath, content)
+		chainCache[key] = chain
 		if len(chain) > 0 {
 			endpoints[i].CallChain = chain
 		}
